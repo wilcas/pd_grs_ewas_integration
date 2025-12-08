@@ -1,0 +1,1274 @@
+---
+title: "TERRE GRS: Epigenome-wide asssociation analysis"
+output: html_notebook
+---
+
+The manuscript "A Parkinson’s disease genetic risk score associates with blood DNAm on chromosome 17" explores how a genetic risk score (GRS) for Parkinson's disease (PD) associates with blood DNA methylation in the TERRE study of French agricultural workers, and evaluates GRS associations with DNAm in each sex as well as their sensitivity to non-genetic factors. This was originally spearheaded by Will Casazza and was posted as a pre-print on medRxiv in 2023. The current revision (2024, led by Sam Schaffner) aims to address previous reviewer feedback and prepare the manuscript for re-submission.
+
+
+In this script, EWAS is conducted to identify DNAm patterns associated with the GRS in the cross-sex and sex-stratified samples in TERRE. The models are adjusted for batch, cell type, and disease status. Results will be compared with the previous models (adjusted for 10 DNAm PCs).
+
+
+Last updated Nov 15, 2025 by Samantha Schaffner: using 83-SNP GRS.
+
+Based on code by Will Casazza
+
+```{r setup, include=FALSE, eval=F}
+library(lumi)
+library(limma)
+library(minfi)
+library(rcompanion)
+library(readxl)
+library(tidyverse)
+library(ggpubr)
+library(glue)
+library(data.table)
+library(car)
+library(bacon)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(rtracklayer)
+library(DescTools)
+library(Gviz)
+library(plyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+source("~/kobor_shared_coding_resource/qqplot_NG.R")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Loading in and preparing data
+```{r load dat, eval=FALSE}
+meta <- read.csv("~/PD_GRS/meta_geno_DNAm_PCs_15Nov2025.csv")
+
+# DNAm data (2022, most recent QC'ed, same as npj PD 2024 article)
+load("~/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/1-TERRE_RG_filtered.RData")
+mvals <- getM(PD_RG_filtered)
+```
+
+# Association analysis
+
+## EWAS model checks
+
+Prior to looking at results, I'll assess whether the new EWAS model seems appropriate using three measures:
+
+*1. Variance inflation factor*: The variance inflation factor (VIF) can be used to detect collinearity. Higher VIF values indicate a greater degree of collinearity. Typically VIF < 5 is considered acceptable.
+
+
+*2. Q-Q plot of nominal p-values*: If the variable of interest does not affect global DNAm, p-values should distribute close to the center line on a normal Q-Q plot, with some deviation at the tail indicating associations detected. The shape of the Q-Q plot can visually indicate model inflation or deflation.
+
+
+*3. Bias and inflation calculations*: The "bacon" package (van Iterson et al., 2017) was developed to calculate and optionally, correct for, bias and inflation observed in epigenome-wide association studies. It models test statistics using a Bayesian mixture model, and estimates the model parameters: bias (mean) and inflation (standard deviation). The Bayesian mixture model is proposed to more accurately model the quantitative nature and technical/biological influences on epigenomic and transcriptomic data, as opposed to the traditional genomic inflation factor (based on discrete genotypes).
+
+
+```{r ewas models, eval=F}
+## Preparing data
+# match meta data and M-values
+meta <- meta[complete.cases(meta$CTP_PC1),]
+mvals <- mvals[,match(meta$patient, colnames(mvals))]
+all(colnames(mvals)==meta$patient) #TRUE
+
+# subset meta data to relevant columns and re-format
+meta_sub <- meta[,c("patient","GRS_scaled","SCORE1_AVG","PD","age","sex","geno_V3","geno_V4","geno_V5","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","CTP_PC6","smoking","pesticides","head_trauma","alcohol1","levodopa","agonist","plate","SentrixPosition_A")]
+str(meta_sub)
+meta_sub$PD <- as.factor(meta_sub$PD)
+meta_sub$sex <- as.factor(meta_sub$sex)
+meta_sub$smoking <- as.factor(meta_sub$smoking)
+meta_sub$pesticides <- as.factor(meta_sub$pesticides)
+meta_sub$head_trauma <- as.factor(meta_sub$head_trauma)
+meta_sub$alcohol1 <- as.factor(meta_sub$alcohol1)
+meta_sub$levodopa <- as.factor(meta_sub$levodopa)
+meta_sub$plate <- as.factor(meta_sub$plate)
+meta_sub$SentrixPosition_A <- as.factor(meta_sub$SentrixPosition_A)
+
+## Variance inflation factor
+# check for one CpG (result is the same as when applied to all CpGs and averaged)
+vif(lm(mvals[1,] ~ meta_sub$GRS_scaled + meta_sub$age + meta_sub$sex + meta_sub$geno_V3 + meta_sub$geno_V4 + meta_sub$geno_V5 + meta_sub$CTP_PC1 + meta_sub$CTP_PC2 + meta_sub$CTP_PC3 + meta_sub$CTP_PC4 + meta_sub$CTP_PC5 + meta_sub$CTP_PC6 + meta_sub$plate + meta_sub$SentrixPosition_A + meta_sub$PD))[,3]
+#       meta_sub$GRS_scaled               meta_sub$age               meta_sub$sex           meta_sub$geno_V3           meta_sub$geno_V4           meta_sub$geno_V5 
+#                  1.042602                   1.109200                   1.541326                   1.085064                   1.101569                   1.061150 
+#          meta_sub$CTP_PC1           meta_sub$CTP_PC2           meta_sub$CTP_PC3           meta_sub$CTP_PC4           meta_sub$CTP_PC5           meta_sub$CTP_PC6 
+#                  1.096277                   1.130351                   1.316783                   1.141944                   1.244352                   1.159645 
+#            meta_sub$plate meta_sub$SentrixPosition_A                meta_sub$PD 
+#                  1.135184                   1.051294                   1.073484
+
+
+## Q-Q plot
+#scaled GRS
+pvals <- sapply(1:nrow(mvals), function(x) {
+  coef(summary(lm(mvals[x,] ~ meta_sub$GRS_scaled + meta_sub$age + meta_sub$sex + meta_sub$geno_V3 + meta_sub$geno_V4 + meta_sub$geno_V5 + meta_sub$CTP_PC1 + meta_sub$CTP_PC2 + meta_sub$CTP_PC3 + meta_sub$CTP_PC4 + meta_sub$CTP_PC5 + meta_sub$CTP_PC6 + meta_sub$plate + meta_sub$SentrixPosition_A + meta_sub$PD)))[2,4]
+   }) #runtime ~1 hour
+qqunif.plot(pvals, title="Model adjusted for PD, batch, and cell type")
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals)
+bacon(zvals)
+#...estimated bias: -0.27.
+#...estimated inflation: 1.
+
+#non-scaled GRS
+pvals_orig <- sapply(1:nrow(mvals), function(x) {
+  coef(summary(lm(mvals[x,] ~ meta_sub$SCORE1_AVG + meta_sub$age + meta_sub$sex + meta_sub$geno_V3 + meta_sub$geno_V4 + meta_sub$geno_V5 + meta_sub$CTP_PC1 + meta_sub$CTP_PC2 + meta_sub$CTP_PC3 + meta_sub$CTP_PC4 + meta_sub$CTP_PC5 + meta_sub$CTP_PC6 + meta_sub$plate + meta_sub$SentrixPosition_A + meta_sub$PD)))[2,4]
+   })
+qqunif.plot(pvals_orig, title="Model adjusted for PD, batch, and cell type")
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_orig)
+bacon(zvals)
+#...estimated bias: -0.27.
+#...estimated inflation: 1.
+
+### Model is biased, regardless of whether new GRS is scaled.
+```
+![Q-Q plot for updated EWAS model](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_grs_scaled_16Nov2025.png)
+
+The model with the 83-SNP GRS is biased according to the shifted distribution observed on the Q-Q plot, and when compared with the empirical null using bacon. Next, let's check the meta data correlation heat map and loadings of the variables onto DNAm PCs, to give clues how to optimize the model.
+
+## Meta data correlation heat map
+```{r meta heat, eval=F}
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+source("~/kobor_shared_coding_resource/correlation_pval.R")
+
+#Create correlation matrix
+terre_meta_cor <- meta_sub[,-(c(1,3))] #remove "patient" and non-scaled GRS
+cormat <- correlation_pval(terre_meta_cor)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+upper_tri <- get_upper_tri(cormat)
+
+#colour if sig
+for(x in 1:nrow(upper_tri)){
+  for(y in 1:ncol(upper_tri)){
+    if(is.na(upper_tri[x,y])==FALSE){
+    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+  }}
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+png("~/PD_GRS/EWAS_TERRE/terre_meta_cor.png", width=600, height=600)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+```
+![Meta data correlation heat map](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/terre_meta_cor.png)
+
+Sex is correlated strongly with cell type, smoking, pesticide exposure, and alcohol intake.
+
+Row is correlated strongly with cell type PC5.
+
+The GRS correlates moderately with PD status.
+
+## PCA correlation with meta data
+```{r DNAm meta pca, eval=F}
+#restructing meta data and subsetting to categorical/continuous
+nrow(terre_sub <- meta_sub[meta_sub$patient %in% colnames(mvals),]) #218
+terre_sub <- terre_sub[match(colnames(mvals), terre_sub$patient),]
+str(terre_sub))
+terre_sub$agonist <- as.factor(terre_sub$agonist)
+rownames(terre_sub) <- terre_sub$patient
+
+meta_categorical <- terre_sub[,c("PD","sex","smoking","pesticides","head_trauma","alcohol1","levodopa","agonist","plate","SentrixPosition_A")]
+meta_continuous <- terre_sub[,c("GRS_scaled","age","geno_V3","geno_V4","geno_V5","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(colnames(mvals), rownames(meta_categorical)) #TRUE
+
+#PCA on M-values: input
+PCA_full<-princomp(mvals[complete.cases(mvals),])
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_scree.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_heat_legend.png)
+
+The GRS does not load onto the first 10 PCs, suggesting no strong association between the GRS and DNAm. The strongest associations are cell type, plate, sex, smoking, pesticide exposure, and alcohol intake.
+
+
+## Sex stratification
+
+While there is not expected to be a strong "tail" on the Q-Q plot due to lack of association between the GRS and DNAm PCs, let's aim to reduce the model bias and see if any associations are detectable. As males and females have very different exposure levels, we will start by sex-stratifying the data.
+
+```{r sex strat, eval=F}
+#### sex stratification
+ncol(mvals_F <- mvals[,colnames(mvals) %in% meta_sub[meta_sub$sex=="F","patient"]]) #100
+nrow(meta_F <- meta_sub[match(colnames(mvals_F),meta_sub$patient),]) #100
+ncol(mvals_M <- mvals[,colnames(mvals) %in% meta_sub[meta_sub$sex=="M","patient"]]) #118
+nrow(meta_M <- meta_sub[match(colnames(mvals_M),meta_sub$patient),]) #118
+
+# PCA females
+rownames(meta_F) <- meta_F$patient
+meta_categorical <- meta_F[,c("PD","smoking","pesticides","head_trauma","alcohol1","levodopa","agonist","plate","SentrixPosition_A")]
+meta_continuous <- meta_F[,c("GRS_scaled","age","geno_V3","geno_V4","geno_V5","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+all.equal(colnames(mvals_F), rownames(meta_categorical)) #TRUE
+
+#PCA on M-values: input
+PCA_full<-princomp(mvals_F[complete.cases(mvals_F),])
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+
+#females
+pvals_F <- sapply(1:nrow(mvals_F), function(x) {
+  coef(summary(lm(mvals_F[x,] ~ meta_F$GRS_scaled + meta_F$age + meta_F$geno_V3 + meta_F$geno_V4 + meta_F$geno_V5 + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$plate + meta_F$SentrixPosition_A + meta_F$PD)))[2,4]
+   })
+png("~/PD_GRS/EWAS_TERRE/qqplot_F.png")
+qqunif.plot(pvals_F, title="Females model")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_F)
+bacon(zvals)
+#...estimated bias: 0.05.
+#...estimated inflation: 0.98.
+
+#males
+# PCA females
+rownames(meta_M) <- meta_M$patient
+meta_categorical <- meta_M[,c("PD","smoking","pesticides","head_trauma","alcohol1","levodopa","agonist","plate","SentrixPosition_A")]
+meta_continuous <- meta_M[,c("GRS_scaled","age","geno_V3","geno_V4","geno_V5","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+all.equal(colnames(mvals_M), rownames(meta_categorical)) #TRUE
+
+#PCA on M-values: input
+PCA_full<-princomp(mvals_M[complete.cases(mvals_M),])
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+
+pvals_M <- sapply(1:nrow(mvals_M), function(x) {
+  coef(summary(lm(mvals_M[x,] ~ meta_M$GRS_scaled + meta_M$age + meta_M$geno_V3 + meta_M$geno_V4 + meta_M$geno_V5 + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$PD)))[2,4]
+   })
+png("~/PD_GRS/EWAS_TERRE/qqplot_M.png")
+qqunif.plot(pvals_M, title="Males model")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_M)
+bacon(zvals)
+#...estimated bias: -0.34.
+#...estimated inflation: 1.
+```
+![PCA scree plot: females only](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_scree_F.png)
+
+![PCA heat map: females only](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_heat_F.png)
+
+The first 10 PCs do not correlate with the GRS, PD status, or environmental variables, apart from a weak correlation of alcohol intake with PC8.
+
+
+![Q-Q plot: females only](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_F.png)
+
+The females-only model is significantly better than the cross-sex model, just slightly deflated.
+
+
+![PCA scree plot: males only](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_scree_M.png)
+
+![PCA heat map: males only](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_heat_M.png)
+
+Head trauma correlates with PC2. There are also weak correlations of PC5 with PD status, PC7 with smoking, and PC8 with head trauma, smoking, and PD.
+
+
+![Q-Q plot: males only](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_M.png)
+
+The males appear to be driving the bias that was observed in the cross-sex model.
+
+
+## Males-only model optimization
+
+Next let's try adjusting for head trauma in the male-only model to see if it improves bias.
+
+```{r male ht, eval=F}
+vif(lm(mvals_M[1,] ~ meta_M$GRS_scaled + meta_M$age + meta_M$head_trauma + meta_M$geno_V3 + meta_M$geno_V4 + meta_M$geno_V5 + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$PD))[,3]
+#       meta_M$GRS_scaled               meta_M$age       meta_M$head_trauma           meta_M$geno_V3 
+#                1.054797                 1.165156                 1.109223                 1.130007 
+#          meta_M$geno_V4           meta_M$geno_V5           meta_M$CTP_PC1           meta_M$CTP_PC2 
+#                1.130977                 1.157928                 1.154730                 1.182198 
+#          meta_M$CTP_PC3           meta_M$CTP_PC4           meta_M$CTP_PC5           meta_M$CTP_PC6 
+#                1.191569                 1.238024                 1.301678                 1.124866 
+#            meta_M$plate meta_M$SentrixPosition_A                meta_M$PD 
+#                1.131692                 1.106613                 1.164631 
+
+pvals_M <- sapply(1:nrow(mvals_M), function(x) {
+  coef(summary(lm(mvals_M[x,] ~ meta_M$GRS_scaled + meta_M$age + meta_M$geno_V3 + meta_M$geno_V4 + meta_M$geno_V5 + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$PD + meta_M$head_trauma)))[2,4]
+   })
+png("~/PD_GRS/EWAS_TERRE/qqplot_ht_M.png")
+qqunif.plot(pvals_M, title="Males model, adjusted for head trauma")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_M)
+bacon(zvals)
+#...estimated bias: -0.31.
+#...estimated inflation: 1.
+```
+![Head trauma-adjusted model](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_ht_M.png)
+
+This slightly reduces bias.
+
+Next, adjust for smoking and alcohol consumption, as done in the previous TERRE npj PD paper.
+
+```{r male ht alc smoke, eval=F}
+vif(lm(mvals_M[1,] ~ meta_M$GRS_scaled + meta_M$age + meta_M$head_trauma + meta_M$smoking + meta_M$alcohol1 + meta_M$geno_V3 + meta_M$geno_V4 + meta_M$geno_V5 + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$PD))[,3]
+
+
+pvals_M <- sapply(1:nrow(mvals_M), function(x) {
+  coef(summary(lm(mvals_M[x,] ~ meta_M$GRS_scaled + meta_M$age + meta_M$geno_V3 + meta_M$geno_V4 + meta_M$geno_V5 + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$PD + meta_M$head_trauma + meta_M$alcohol1 + meta_M$smoking)))[2,4]
+   })
+png("~/PD_GRS/EWAS_TERRE/qqplot_ht_smoke_alc_M.png")
+qqunif.plot(pvals_M, title="Males model, adjusted for head trauma, smoking, and alcohol")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_M)
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 803777 test-statistics.
+#...estimated bias: -0.21.
+#...estimated inflation: 1.
+```
+![Head trauma, smoking, and alcohol-adjusted model](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_ht_smoke_alc_M.png)
+
+Adjusting for smoking and alcohol further improved bias and the Q-Q plot.
+
+## Cross-sex model adjusted for environmental covariates
+
+Finally, let's go back to the cross-sex model and see how this looks when adjusted for head trauma, smoking, and alcohol.
+
+```{r terre cross sex cov adj, eval=F}
+#scaled GRS
+pvals_x_sex <- sapply(1:nrow(mvals), function(x) {
+  coef(summary(lm(mvals[x,] ~ meta_sub$GRS_scaled + meta_sub$age + meta_sub$sex + meta_sub$geno_V3 + meta_sub$geno_V4 + meta_sub$geno_V5 + meta_sub$CTP_PC1 + meta_sub$CTP_PC2 + meta_sub$CTP_PC3 + meta_sub$CTP_PC4 + meta_sub$CTP_PC5 + meta_sub$CTP_PC6 + meta_sub$plate + meta_sub$SentrixPosition_A + meta_sub$PD + meta_sub$head_trauma + meta_sub$smoking + meta_sub$alcohol1)))[2,4]
+   })
+png("~/PD_GRS/EWAS_TERRE/qqplot_ht_smoke_alc.png")
+qqunif.plot(pvals_x_sex, title="Model adjusted for head trauma, smoking, and alcohol")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_x_sex)
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 803777 test-statistics.
+#...estimated bias: -0.24.
+#...estimated inflation: 1.
+```
+![Q-Q plot for covariate-adjusted cross-sex EWAS model](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_ht_smoke_alc.png)
+
+There is a minor improvement in the cross-sex model adjusted for additional covariates, though it is quite similar overall to the unadjusted model.
+
+# Propensity matching
+
+The MatchIt package can be used to weight treatment and control groups such that the biasing effects of covariate imbalances are reduced.
+
+### Cross-sex
+```{r MatchIt, eval=F}
+library(MatchIt)
+
+# Check initial imbalances
+#create a matchit object relating the treatment to the covariates
+
+### Treatment must be binary! Split by the median of the GRS.
+summary(meta_sub$GRS_scaled)
+#     Min.   1st Qu.    Median      Mean   3rd Qu.      Max. 
+#-2.347875 -0.643047 -0.074174 -0.001345  0.691074  2.826025 
+
+meta_sub$GRS_above_med <- (meta_sub$GRS_scaled > median(meta_sub$GRS_scaled))
+summary(meta_sub$GRS_above_med)
+#   Mode   FALSE    TRUE 
+#logical     109     109 
+
+cross.out0 <- summary(matchit(GRS_above_med ~ age + alcohol1 + smoking + head_trauma, data = meta_sub,
+                 method = NULL, distance = "glm"))$sum.all
+
+cross.out0
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio   eCDF Mean    eCDF Max Std. Pair Dist.
+#distance         0.5082936    0.49170638      0.26171314  0.9477532 0.072455729 0.165137615              NA
+#age             67.0865123   66.76623401      0.05495052  0.6691645 0.033208425 0.100917431              NA
+#alcohol11        0.1467890    0.19266055     -0.12961896         NA 0.045871560 0.045871560              NA
+#alcohol12        0.3669725    0.32110092      0.09517337         NA 0.045871560 0.045871560              NA
+#alcohol13        0.0733945    0.11009174     -0.14071951         NA 0.036697248 0.036697248              NA
+#alcohol14        0.4128440    0.37614679      0.07453560         NA 0.036697248 0.036697248              NA
+#smoking1         0.6788991    0.72477064     -0.09824719         NA 0.045871560 0.045871560              NA
+#smoking2         0.2477064    0.21100917      0.08501023         NA 0.036697248 0.036697248              NA
+#smoking3         0.0733945    0.06422018      0.03517988         NA 0.009174312 0.009174312              NA
+#head_trauma0     0.8165138    0.87155963     -0.14221364         NA 0.055045872 0.055045872              NA
+#head_trauma1     0.1834862    0.12844037      0.14221364         NA 0.055045872 0.055045872              NA
+
+# Matching
+cross.out1 <- matchit(GRS_above_med ~ age + alcohol1 + smoking + head_trauma, data = meta_sub,
+                 method = "full", distance = "glm", link="probit")
+
+summary(cross.out1)
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.5083        0.5079          0.0061     0.9917    0.0075   0.0459          0.0290
+#age                67.0865       65.7759          0.2249     0.5270    0.0457   0.1482          0.9946
+#alcohol11           0.1468        0.1789         -0.0907          .    0.0321   0.0321          0.2587
+#alcohol12           0.3670        0.4855         -0.2459          .    0.1185   0.1185          0.5260
+#alcohol13           0.0734        0.0596          0.0528          .    0.0138   0.0138          0.1890
+#alcohol14           0.4128        0.2760          0.2780          .    0.1369   0.1369          0.5721
+#smoking1            0.6789        0.6713          0.0164          .    0.0076   0.0076          0.3469
+#smoking2            0.2477        0.2424          0.0124          .    0.0054   0.0054          0.3100
+#smoking3            0.0734        0.0864         -0.0498          .    0.0130   0.0130          0.4861
+#head_trauma0        0.8165        0.8257         -0.0237          .    0.0092   0.0092          0.2001
+#head_trauma1        0.1835        0.1743          0.0237          .    0.0092   0.0092          0.2001
+#
+#Sample Sizes:
+#              Control Treated
+#All            109.       109
+#Matched (ESS)   53.15     109
+#Matched        109.       109
+#Unmatched        0.         0
+#Discarded        0.         0
+
+plot(cross.out1, type = "jitter", interactive = FALSE)
+plot(summary(cross.out1), xlim=c(0,0.8), main="TERRE cross-sex: probit link")
+
+cross.out2 <- matchit(GRS_above_med ~ age + alcohol1 + smoking + head_trauma, data = meta_sub,
+                 method = "full", distance = "glm", link="logit")
+plot(summary(cross.out2), xlim=c(0,0.8), main="TERRE cross-sex: logit link")
+# probit looked better (less extreme distance changes)
+
+# Add weights to meta data and save
+meta_matched <- match.data(cross.out1)
+write.csv(meta_matched, file="~/PD_GRS/EWAS_TERRE/terre_meta_probit_matched_30Nov2025.csv", row.names=F)
+```
+![Propensity scores after matching: cross-sex](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/propscores_cross_probit.png)
+
+![Standardized mean difference after matching: cross-sex](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/SMD_cross_probit.png)
+
+### Females
+```{r MatchIt F, eval=F}
+# Check initial imbalances
+#create a matchit object relating the treatment to the covariates
+
+meta_F$GRS_above_med <- (meta_F$GRS_scaled > median(meta_sub$GRS_scaled))
+summary(meta_F$GRS_above_med)
+#   Mode   FALSE    TRUE 
+#logical      51      49 
+
+F.out0 <- summary(matchit(GRS_above_med ~ age + alcohol1 + smoking + head_trauma, data = meta_F,
+                 method = NULL, distance = "glm"))$sum.all
+
+F.out0
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio   eCDF Mean    eCDF Max Std. Pair Dist.
+#distance        0.53405764    0.44767011      0.74656098  0.4885496 0.156597333 0.273309324              NA
+#age            67.22429424   64.10033418      0.66821960  0.4202775 0.122552114 0.224889956              NA
+#alcohol11       0.24489796    0.27450980     -0.06886048         NA 0.029611845 0.029611845              NA
+#alcohol12       0.57142857    0.50980392      0.12452653         NA 0.061624650 0.061624650              NA
+#alcohol13       0.04081633    0.07843137     -0.19010509         NA 0.037615046 0.037615046              NA
+#alcohol14       0.14285714    0.13725490      0.01600974         NA 0.005602241 0.005602241              NA
+#smoking1        0.93877551    0.92156863      0.07177261         NA 0.017206883 0.017206883              NA
+#smoking2        0.06122449    0.03921569      0.09180217         NA 0.022008804 0.022008804              NA
+#smoking3        0.00000000    0.03921569     -0.28289930         NA 0.039215686 0.039215686              NA
+#head_trauma0    0.81632653    0.84313725     -0.06923941         NA 0.026810724 0.026810724              NA
+#head_trauma1    0.18367347    0.15686275      0.06923941         NA 0.026810724 0.026810724              NA
+
+# Matching
+F.out1 <- matchit(GRS_above_med ~ age + alcohol1 + smoking + head_trauma, data = meta_F,
+                 method = "full", distance = "glm", link="probit")
+
+summary(F.out1)
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.5341        0.5292          0.0422     0.8872    0.0199   0.0816          0.2136
+#age                67.2243       67.5302         -0.0654     0.8396    0.0353   0.1243          0.7301
+#alcohol11           0.2449        0.3117         -0.1553          .    0.0668   0.0668          1.0759
+#alcohol12           0.5714        0.4295          0.2868          .    0.1419   0.1419          0.9350
+#alcohol13           0.0408        0.1039         -0.3188          .    0.0631   0.0631          0.4526
+#alcohol14           0.1429        0.1549         -0.0345          .    0.0121   0.0121          0.5118
+#smoking1            0.9388        0.9536         -0.0619          .    0.0148   0.0148          0.3735
+#smoking2            0.0612        0.0427          0.0774          .    0.0186   0.0186          0.2490
+#smoking3            0.0000        0.0037         -0.0268          .    0.0037   0.0037          0.2153
+#head_trauma0        0.8163        0.7752          0.1062          .    0.0411   0.0411          0.9636
+#head_trauma1        0.1837        0.2248         -0.1062          .    0.0411   0.0411          0.9636
+#
+#Sample Sizes:
+#              Control Treated
+#All             51.        49
+#Matched (ESS)   24.73      49
+#Matched         51.        49
+#Unmatched        0.         0
+#Discarded        0.         0
+
+plot(F.out1, type = "jitter", interactive = FALSE)
+plot(summary(F.out1), xlim=c(0,0.8), main="TERRE females: probit link")
+
+# Add weights to meta data and save
+meta_F_matched <- match.data(F.out1)
+write.csv(meta_F_matched, file="~/PD_GRS/EWAS_TERRE/terre_meta_F_probit_matched_30Nov2025.csv", row.names=F)
+```
+![Propensity scores after matching: females](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/propscores_F_probit.png)
+
+![Standardized mean difference after matching: females](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/SMD_F_probit.png)
+
+### Males
+```{r MatchIt M, eval=F}
+# Check initial imbalances
+#create a matchit object relating the treatment to the covariates
+
+meta_M$GRS_above_med <- (meta_M$GRS_scaled > median(meta_sub$GRS_scaled))
+summary(meta_M$GRS_above_med)
+#   Mode   FALSE    TRUE 
+#logical      58      60 
+
+M.out0 <- summary(matchit(GRS_above_med ~ age + alcohol1 + smoking + head_trauma, data = meta_M,
+                 method = NULL, distance = "glm"))$sum.all
+
+M.out0
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio  eCDF Mean   eCDF Max Std. Pair Dist.
+#distance        0.54284373     0.4729203      0.52428871   1.199955 0.16031536 0.34195402              NA
+#age            66.97399042    69.1103873     -0.32071099   1.148963 0.11215738 0.23448276              NA
+#alcohol11       0.06666667     0.1206897     -0.21657376         NA 0.05402299 0.05402299              NA
+#alcohol12       0.20000000     0.1551724      0.11206897         NA 0.04482759 0.04482759              NA
+#alcohol13       0.10000000     0.1379310     -0.12643678         NA 0.03793103 0.03793103              NA
+#alcohol14       0.63333333     0.5862069      0.09779411         NA 0.04712644 0.04712644              NA
+#smoking1        0.46666667     0.5517241     -0.17049424         NA 0.08505747 0.08505747              NA
+#smoking2        0.40000000     0.3620690      0.07742640         NA 0.03793103 0.03793103              NA
+#smoking3        0.13333333     0.0862069      0.13863382         NA 0.04712644 0.04712644              NA
+#head_trauma0    0.81666667     0.8965517     -0.20645358         NA 0.07988506 0.07988506              NA
+#head_trauma1    0.18333333     0.1034483      0.20645358         NA 0.07988506 0.07988506              NA
+
+# Matching
+M.out1 <- matchit(GRS_above_med ~ age + alcohol1 + smoking + head_trauma, data = meta_M,
+                 method = "full", distance = "glm", link="probit")
+
+summary(M.out1)
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.5428        0.5393          0.0265     1.0993    0.0154   0.0833          0.0581
+#age                66.9740       66.8602          0.0171     1.0541    0.0283   0.0931          0.6799
+#alcohol11           0.0667        0.0819         -0.0612          .    0.0153   0.0153          0.3864
+#alcohol12           0.2000        0.2367         -0.0917          .    0.0367   0.0367          0.6928
+#alcohol13           0.1000        0.0986          0.0046          .    0.0014   0.0014          0.6426
+#alcohol14           0.6333        0.5828          0.1049          .    0.0506   0.0506          0.7251
+#smoking1            0.4667        0.5181         -0.1030          .    0.0514   0.0514          0.8211
+#smoking2            0.4000        0.3597          0.0822          .    0.0403   0.0403          0.8854
+#smoking3            0.1333        0.1222          0.0327          .    0.0111   0.0111          0.4253
+#head_trauma0        0.8167        0.8250         -0.0215          .    0.0083   0.0083          0.5293
+#head_trauma1        0.1833        0.1750          0.0215          .    0.0083   0.0083          0.5293
+#
+#Sample Sizes:
+#              Control Treated
+#All             58.        60
+#Matched (ESS)   22.32      60
+#Matched         58.        60
+#Unmatched        0.         0
+#Discarded        0.         0
+
+plot(M.out1, type = "jitter", interactive = FALSE)
+plot(summary(M.out1), xlim=c(0,0.8), main="TERRE males: probit link")
+
+# Add weights to meta data and save
+meta_M_matched <- match.data(M.out1)
+write.csv(meta_M_matched, file="~/PD_GRS/EWAS_TERRE/terre_meta_M_probit_matched_30Nov2025.csv", row.names=F)
+```
+![Propensity scores after matching: males](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/propscores_M_probit.png)
+
+![Standardized mean difference after matching: males](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/SMD_M_probit.png)
+
+# Models check with propensity weights
+```{r models propensity, eval=F}
+## Cross-sex
+pvals_x_sex <- sapply(1:nrow(mvals), function(x) {
+  coef(summary(lm(mvals[x,] ~ meta_matched$GRS_scaled + meta_matched$age + meta_matched$sex + meta_matched$geno_V3 + meta_matched$geno_V4 + meta_matched$geno_V5 + meta_matched$CTP_PC1 + meta_matched$CTP_PC2 + meta_matched$CTP_PC3 + meta_matched$CTP_PC4 + meta_matched$CTP_PC5 + meta_matched$CTP_PC6 + meta_matched$plate + meta_matched$SentrixPosition_A + meta_matched$PD + meta_matched$head_trauma + meta_matched$smoking + meta_matched$alcohol1, weights=meta_matched$weights)))[2,4]
+   })
+png("~/PD_GRS/EWAS_TERRE/qqplot_cross_weighted.png")
+qqunif.plot(pvals_x_sex, title="Cross-sex, weighted")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_x_sex)
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 803777 test-statistics.
+#...estimated bias: -0.37.
+#...estimated inflation: 1.1.
+
+## Females
+pvals_F <- sapply(1:nrow(mvals_F), function(x) {
+  coef(summary(lm(mvals_F[x,] ~ meta_F_matched$GRS_scaled + meta_F_matched$age + meta_F_matched$geno_V3 + meta_F_matched$geno_V4 + meta_F_matched$geno_V5 + meta_F_matched$CTP_PC1 + meta_F_matched$CTP_PC2 + meta_F_matched$CTP_PC3 + meta_F_matched$CTP_PC4 + meta_F_matched$CTP_PC5 + meta_F_matched$CTP_PC6 + meta_F_matched$plate + meta_F_matched$SentrixPosition_A + meta_F_matched$PD + meta_F_matched$head_trauma + meta_F_matched$smoking + meta_F_matched$alcohol1, weights=meta_F_matched$weights)))[2,4]
+   })
+png("~/PD_GRS/EWAS_TERRE/qqplot_F_weighted.png")
+qqunif.plot(pvals_F, title="Females, weighted")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_F)
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 803777 test-statistics.
+#...estimated bias: -0.036.
+#...estimated inflation: 1.
+
+## Males
+pvals_M <- sapply(1:nrow(mvals_M), function(x) {
+  coef(summary(lm(mvals_M[x,] ~ meta_M_matched$GRS_scaled + meta_M_matched$age + meta_M_matched$geno_V3 + meta_M_matched$geno_V4 + meta_M_matched$geno_V5 + meta_M_matched$CTP_PC1 + meta_M_matched$CTP_PC2 + meta_M_matched$CTP_PC3 + meta_M_matched$CTP_PC4 + meta_M_matched$CTP_PC5 + meta_M_matched$CTP_PC6 + meta_M_matched$plate + meta_M_matched$SentrixPosition_A + meta_M_matched$PD + meta_M_matched$head_trauma + meta_M_matched$smoking + meta_M_matched$alcohol1, weights=meta_M_matched$weights)))[2,4]
+   })
+png("~/PD_GRS/EWAS_TERRE/qqplot_M_weighted.png")
+qqunif.plot(pvals_M, title="Males, weighted")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_M)
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 803777 test-statistics.
+#...estimated bias: 0.077.
+#...estimated inflation: 0.97.
+```
+![Cross-sex model with propensity weights](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_cross_weighted.png)
+
+![Females model with propensity weights](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_F_weighted.png)
+
+![Males model with propensity weights](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_M_weighted.png)
+
+## Differential methylation analysis
+
+Will used limma on all EPIC probes passing QC, modeling the data with M-values. I'll continue with this approach and transform results back to beta values later for plotting and interpretation purposes.
+
+First, as Will did, I'll apply the updated models to (1) the cross-sex sample, (2) males, (3) females, (4) PD cases, and (5) controls. This permits us to detect whether GRS associations with DNAm are dependent on sex and/or disease status.
+
+```{r prs ewas, eval=F}
+####### Cross-sex PRS EWAS
+# limma design matrix and linear model fit
+design_prs <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD + head_trauma + smoking + alcohol1, data = meta_matched)
+prs_fit <- lmFit(mvals, design_prs, weights=meta_matched$weights)
+prs_fit <- eBayes(prs_fit)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+prs_res <- limma::topTable(prs_fit, coef = 2, number = Inf, genelist=rownames(mvals))
+prs_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$adj.P.Val<=0.05,]) #0
+#### logFC column is the model coefficient
+
+####### Cases only
+design_prs_case <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + head_trauma + smoking + alcohol1, data = meta_matched[meta_matched$PD=="1",])
+prs_fit_case <- lmFit(mvals[,match(unlist(meta_matched[meta_sub$PD=="1","patient"]), colnames(mvals))], design_prs_case, weights=meta_matched[meta_matched$PD=="1","weights"])
+prs_fit_case <- eBayes(prs_fit_case)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_case$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+case_res <- limma::topTable(prs_fit_case, coef = 2, number = Inf, genelist=rownames(mvals))
+case_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(case_res[abs(case_res$adjDB)>=0.03 & case_res$adj.P.Val<=0.05,]) #0
+
+# Controls only
+design_prs_control <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + head_trauma + alcohol1 + smoking, data = meta_matched[meta_matched$PD=="0",])
+prs_fit_control <- lmFit(mvals[,match(unlist(meta_matched[meta_matched$PD=="0","patient"]), colnames(mvals))], design_prs_control, weight=meta_matched[meta_matched$PD=="0","weights"])
+prs_fit_control <- eBayes(prs_fit_control)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_control$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+control_res <- limma::topTable(prs_fit_control, coef = 2, number = Inf, genelist=rownames(mvals))
+control_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(control_res[abs(control_res$adjDB)>=0.03 & control_res$adj.P.Val<=0.05,]) #44
+
+# Males
+design_prs_male <- model.matrix(~ 1 + GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD + smoking + alcohol1 + head_trauma, data = meta_M_matched)
+prs_fit_male <- lmFit(mvals[,match(unlist(meta_M_matched[,"patient"]), colnames(mvals_M))], design_prs_male, weights=meta_M_matched$weights)
+# Coefficients not estimable: plate6 plate9 
+# Partial NA coefficients for 803777 probe(s)
+prs_fit_male <- eBayes(prs_fit_male)
+# Estimation of var.prior failed - set to default value
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_male$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+male_res <- limma::topTable(prs_fit_male, coef = 2, number = Inf, genelist=rownames(mvals_M))
+male_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(male_res[abs(male_res$adjDB)>=0.03 & male_res$adj.P.Val<=0.05,]) #0
+
+# Females
+design_prs_female <- model.matrix(~ 1 + GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD + smoking + alcohol1 + head_trauma, data = meta_F_matched)
+prs_fit_female <- lmFit(mvals[,match(unlist(meta_F_matched[,"patient"]), colnames(mvals_F))], design_prs_female, weights=meta_F_matched$weights)
+prs_fit_female <- eBayes(prs_fit_female)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_female$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+female_res <- limma::topTable(prs_fit_female, coef = 2, number = Inf, genelist=rownames(mvals))
+female_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(female_res[abs(female_res$adjDB)>=0.03 & female_res$adj.P.Val<=0.05,]) #0
+
+# PD status EWAS check
+design_pd <- model.matrix(~ 1 + PD + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + smoking + head_trauma + alcohol1, data = meta_matched)
+pd_fit <- lmFit(mvals, design_pd)
+pd_fit <- eBayes(pd_fit)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+pd_fit_coef <- pd_fit$coefficients
+m0_eff <- pd_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + pd_fit_coef[, "PD1"] #M-value model intercept plus GRS coefficient (delta M)
+
+pd_res <- limma::topTable(pd_fit, coef = 2, number = Inf, genelist=rownames(mvals))
+pd_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(pd_res[abs(pd_res$adjDB)>=0.03 & pd_res$adj.P.Val<=0.05,]) #0
+
+# save everything
+# put limma results in separate csv's and together as one RData object for ease later
+#save(mvals, file="~/PD_GRS/TERRE_Mvals.RData")
+#write.csv(meta_sub, file="~/PD_GRS/meta_for_GRS_EWAS.csv", row.names=F)
+save(pd_res, prs_res, control_res, case_res, male_res, female_res, file="~/PD_GRS/EWAS_TERRE/EWAS_limma_all_1Dec25.RData")
+write.csv(pd_res, file="~/PD_GRS/EWAS_TERRE/EWAS_PD_1Dec25.csv", row.names=F)
+write.csv(prs_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_cross_sex_1Dec25.csv", row.names=F)
+write.csv(case_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_cases_1Dec25.csv", row.names=F)
+write.csv(control_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_controls_1Dec25.csv", row.names=F)
+write.csv(male_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_males_1Dec25.csv", row.names=F)
+write.csv(female_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_females_1Dec25.csv", row.names=F)
+```
+
+### Plotting results
+
+Thresholds: adjusted delta beta > 0.03 (exceeding RMSE of technical replicates), FDR < 0.05.
+
+#### Cross-sex GRS EWAS
+```{r volcano cross sex, eval=F}
+#meta_sub <- read.csv("~/PD_GRS/meta_for_GRS_EWAS.csv")
+#prs_res <- read.csv("~/PD_GRS/EWAS_TERRE/EWAS_GRS_cross_sex.csv")
+#load("~/PD_GRS/TERRE_Mvals.RData")
+
+# annotate topTable
+load("~/kobor_shared_coding_resource/EPIC_fdat.RData")
+fdat <- fData_EPIC[match(rownames(mvals), fData_EPIC$TargetID),]
+all(fdat$TargetID==rownames(mvals))
+colnames(prs_res)[1] <- "TargetID"
+prs_res <- left_join(prs_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(prs_res)[2:3] <- c("delta_M", "avgM")
+
+# M-value volcano plot
+summary(prs_res$threshold_M <- (prs_res$adj.P.Val <= 0.05 & abs(prs_res$delta_M)>=1.5)) #0
+prs_res$DNAm_change <- "NS"
+write.csv(prs_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_cross_sex_1Dec25.csv", row.names=F)
+min(prs_res$adj.P.Val) #[1] 0.008084112
+
+max(abs(prs_res$delta_M)) #0.7237291
+max(-log10(prs_res$P.Value)) #7.964519
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_cross_sex_Mvals_6Dec2025.png", width=200, height=250)
+ggplot(prs_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9.328942e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + xlim(c(-1.8,1.8)) + ylim(c(0,10)) + theme(legend.position="none")
+dev.off()
+
+#B-value volcano plot
+summary(prs_res$threshold_B <- (prs_res$adj.P.Val <= 0.05 & abs(prs_res$adjDB)>=0.03)) #0
+
+max(abs(prs_res$adjDB)) #[1] 0.09734924
+max(-log10(prs_res$P.Value)) #7.964519
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_cross_sex_Bvals_6Dec2025.png", width=200, height=250)
+ggplot(prs_res[,c("adjDB","P.Value","DNAm_change")], aes(x=adjDB, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(0.003256027)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + xlim(c(-0.2,0.2)) + ylim(c(0,10)) + theme(legend.position = "none")
+dev.off()
+
+# Manhattan plot
+prs_res$CHR <- as.factor(prs_res$CHR)
+prs_res$CHR <- reorder.factor(prs_res$CHR, new.order=c(as.character(seq(1:22)), "X","Y"))
+prs_res$col <- as.character(prs_res$CHR)
+prs_res[prs_res$adj.P.Val<=0.05,"col"] <- "sig"
+prs_res$col <- factor(prs_res$col, levels=c(as.character(seq(1:22)), "X","Y","sig"))
+unique(prs_res$col)
+prs_res <- prs_res %>% arrange(col)
+
+max(prs_res[prs_res$adj.P.Val<=0.05,"P.Value"]) #9.328942e-07
+
+png("~/PD_GRS/EWAS_TERRE/cross_sex_manhattan_6Dec2025.png", width=613, height=218)
+ggplot(prs_res, aes(x=CHR, y=-log10(P.Value), col=col)) + geom_jitter() + theme_classic() + scale_colour_manual(values=c(rep(c("black","grey50"),12),"red")) + theme(legend.position="none") + geom_hline(yintercept=-log10(9.328942e-07), linetype="dashed")+
+    geom_label_repel(data = prs_res[prs_res$adj.P.Val<=0.05,],
+            aes(label = UCSC_REFGENE_NAME), size = 3, force = 10, max.overlaps=15)
+dev.off()
+```
+![Updated EWAS model volcano: M-values](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_cross_sex_Mvals_6Dec2025.png)
+
+While a group of CpGs pass the significance threshold, effect sizes are very small.
+
+
+![Updated EWAS model volcano: B-values](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_cross_sex_Bvals_6Dec2025.png)
+
+
+![Updated EWAS model Manhattan plot](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/cross_sex_manhattan_6Dec2025.png)
+
+
+CpGs passing adjP <= 0.05 are distributed relatively evenly across chromosomes.
+
+
+
+#### Cross-sex PD status EWAS
+```{r volcano pd, eval=F}
+#pd_res <- read.csv("~/PD_GRS/EWAS_TERRE/EWAS_PD.csv")
+
+# annotate topTable
+all(fdat$TargetID==rownames(mvals))
+colnames(pd_res)[1] <- "TargetID"
+pd_res <- left_join(pd_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(pd_res)[2:3] <- c("delta_M", "avgM")
+
+#Volcano plot: M-values
+summary(pd_res$threshold_M <- (pd_res$adj.P.Val <= 0.05 & abs(pd_res$delta_M)>=1.5)) #none pass threshold
+min(pd_res$adj.P.Val) #[1] 0.9987099
+pd_res$DNAm_change <- "NS"
+write.csv(pd_res, file="~/PD_GRS/EWAS_TERRE/EWAS_PD_1Dec25.csv", row.names=F)
+
+max(abs(pd_res$delta_M)) #1.508108
+max(-log10(pd_res$P.Value)) #5.144879
+
+# with the same plot parameters as above (for comparison)
+png("~/PD_GRS/EWAS_TERRE/volcano_PD_Mvals_6Dec2025.png", width=200, height=250)
+ggplot(pd_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75)  +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9.328942e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5)+ ylim(c(0,10)) + xlim(c(-1.8,1.8)) + theme(legend.position="none")
+dev.off()
+
+#Volcano plot: B-values
+summary(pd_res$threshold_B <- (pd_res$adj.P.Val <= 0.05 & abs(pd_res$adjDB)>=0.03)) #none pass threshold
+write.csv(pd_res, file="~/PD_GRS/EWAS_TERRE/EWAS_PD_1Dec25.csv", row.names=F)
+
+max(abs(pd_res$adjDB)) #1] 0.1647622
+max(-log10(pd_res$P.Value)) #5.144879
+
+# with the same plot parameters as above (for comparison)
+png("~/PD_GRS/EWAS_TERRE/volcano_PD_Bvals_6Dec2025.png", width=200, height=250)
+ggplot(pd_res[,c("adjDB","P.Value","DNAm_change")], aes(x=adjDB, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75)  +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(0.003256027)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03)+ ylim(c(0,10)) + xlim(c(-0.2,0.2)) + theme(legend.position="none")
+dev.off()
+```
+![Cross-sex EWAS for PD status: M-value plot](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_PD_Mvals_6Dec2025.png)
+
+There are no DNAm changes related to PD status in the cross-sex sample (neither the effect sizes nor p-values come close to any thresholds). 
+
+
+![Cross-sex EWAS for PD status: B-value plot](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_PD_Bvals_6Dec2025.png)
+
+#### Cross-sex GRS EWAS in PD cases
+```{r volcano cases, eval=F}
+#case_res <- read.csv("~/PD_GRS/EWAS_GRS_cases.csv")
+
+# annotate topTable
+all(fdat$TargetID==rownames(mvals))
+colnames(case_res)[1] <- "TargetID"
+case_res <- left_join(case_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(case_res)[2:3] <- c("delta_M", "avgM")
+
+#Volcano plot: M-values
+summary(case_res$threshold_M <- (case_res$adj.P.Val <= 0.05 & abs(case_res$delta_M)>=1.5)) #none
+case_res$DNAm_change <- "NS"
+write.csv(case_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_cases_1Dec25.csv", row.names=F)
+
+max(abs(case_res$delta_M)) #1.06485
+max(-log10(case_res$P.Value)) #5.656784
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_cases_Mvals_6Dec2025.png", width=200, height=250)
+ggplot(case_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9.328942e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + ylim(c(0,10)) + xlim(c(-1.8,1.8)) + theme(legend.position = "none")
+dev.off()
+
+#Volcano plot: B-values
+summary(case_res$threshold_B <- (case_res$adj.P.Val <= 0.05 & abs(case_res$adjDB)>=0.03)) #none
+write.csv(case_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_cases_1Dec25.csv", row.names=F)
+
+max(abs(case_res$adjDB)) #0.1823166
+max(-log10(case_res$P.Value)) #5.656784
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_cases_Bvals_6Dec2025.png", width=200, height=250)
+ggplot(case_res[,c("adjDB","P.Value","DNAm_change")], aes(x=adjDB, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(0.003256027)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + ylim(c(0,10)) + xlim(c(-0.2,0.2)) + theme(legend.position = "none")
+dev.off()
+```
+![EWAS in PD cases: M-values plot](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_cases_Mvals_6Dec2025.png)
+
+There are no DNAm changes related to the GRS in PD cases. 
+
+
+![EWAS in PD cases: B-values plot](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_cases_Bvals_6Dec2025.png)
+
+#### Cross-sex GRS EWAS in controls
+```{r volcano control, eval=F}
+#control_res <- read.csv("~/PD_GRS/EWAS_TERRE/EWAS_GRS_controls.csv")
+
+# annotate topTable
+all(fdat$TargetID==rownames(mvals))
+colnames(control_res)[1] <- "TargetID"
+control_res <- left_join(control_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(control_res)[2:3] <- c("delta_M", "avgM")
+
+#Volcano plot: M-values
+summary(control_res$threshold_M <- (control_res$adj.P.Val <= 0.05 & abs(control_res$delta_M)>=1.5)) #0
+control_res$DNAm_change <- "NS"
+
+max(abs(control_res$delta_M)) # 0.8911281
+max(-log10(control_res$P.Value)) #8.991503
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_controls_Mvals_6Dec25.png", width=200, height=250)
+ggplot(control_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9.328942e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + ylim(c(0,10)) + xlim(c(-1.8,1.8)) + theme(legend.position="none")
+dev.off()
+
+#Volcano plot: B-values
+summary(control_res$threshold_B <- (control_res$adj.P.Val <= 0.05 & abs(control_res$adjDB)>=0.03)) #44
+control_hits <- control_res[control_res$threshold_B==TRUE,]
+write.csv(control_hits, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_controls_hits_1Dec25.csv", row.names=F)
+
+max(control_res[control_res$threshold_B==TRUE,"P.Value"]) #0.003256027
+control_res$DNAm_change <- "NS"
+control_res[control_res$threshold_B==TRUE & control_res$adjDB>0,"DNAm_change"] <- "Increase"
+control_res[control_res$threshold_B==TRUE & control_res$adjDB<0,"DNAm_change"] <- "Decrease"
+summary(as.factor(control_res$DNAm_change))
+#Decrease Increase       NS 
+#      18       26   803733 
+
+write.csv(control_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_controls_1Dec25.csv", row.names=F)
+
+# check gene names of hits
+control_hits$UCSC_REFGENE_NAME
+# replace repeated gene names
+control_hits$UCSC_REFGENE_NAME <- as.character(control_hits$UCSC_REFGENE_NAME)
+control_hits$UCSC_REFGENE_NAME <- sapply(1:length(control_hits$UCSC_REFGENE_NAME), function(x){ 
+  if (length(unlist(strsplit(control_hits$UCSC_REFGENE_NAME[x], split=";")))>0){
+    return(unique(unlist(strsplit(control_hits$UCSC_REFGENE_NAME[x], split=";"))))}
+  else { return("") } })
+
+control_res_hits <- control_res[match(control_hits$TargetID, control_res$TargetID),]
+all(control_res_hits$TargetID==control_hits$TargetID)
+control_res_hits$UCSC_REFGENE_NAME <- control_hits$UCSC_REFGENE_NAME
+control_res_other <- control_res[-(which(control_res$TargetID %in% control_hits$TargetID)),]
+control_res_other$UCSC_REFGENE_NAME <- as.character(control_res_other$UCSC_REFGENE_NAME)
+control_res <- rbind(control_res_hits, control_res_other)
+write.csv(control_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_controls_1Dec25.csv", row.names=F)
+write.csv(control_res_hits, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_controls_hits_1Dec25.csv", row.names=F)
+
+max(abs(control_res$adjDB)) #[1] 0.124202
+max(-log10(control_res$P.Value)) #8.991503
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_controls_Bvals.png", width=200, height=250)
+ggplot(control_res[,c("adjDB","P.Value","DNAm_change","UCSC_REFGENE_NAME")], aes(x=adjDB, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("black","black","gray70")) + geom_hline(yintercept=-log10(0.003256027)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) +
+    geom_label_repel(data = control_res[control_res$threshold_B==TRUE,c("adjDB","P.Value","DNAm_change","UCSC_REFGENE_NAME")],
+            aes(label = UCSC_REFGENE_NAME), size = 4, force = 10, max.overlaps=35) + ylim(c(0,10)) + xlim(c(-0.2,0.2)) + theme(legend.position = "none")
+dev.off()
+
+
+### volcano plot of PD status EWAS, coloured by 44 CpGs sig in controls-only
+pd_res$cat <- "NS"
+pd_res[pd_res$TargetID %in% control_res[control_res$threshold_B==TRUE,"TargetID"],"cat"] <- "TERRE_GRS_controls"
+summary(as.factor(pd_res$cat))
+#                NS TERRE_GRS_controls 
+#            803733                 44 
+pd_res$cat <- factor(pd_res$cat, levels=c("TERRE_GRS_controls","NS"))
+
+#M-values
+png("~/PD_GRS/EWAS_TERRE/volcano_TERRE_PD_Mvals_44_6Dec25.png", width=350, height=250)
+ggplot(pd_res[,c("delta_M","P.Value","cat")], aes(x=delta_M, y=-log10(P.Value), colour=cat)) +
+  geom_point(size=1.75) + geom_point(data=pd_res[pd_res$cat=="TERRE_GRS_controls",],size=1.75) +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("red","gray70")) + 
+geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + ggtitle("PD Status EWAS: TERRE") + labs(colour="Category") + xlim(c(-1.8, 1.8)) + ylim(c(0,10)) + geom_hline(yintercept=-log10(9.328942e-07))
+dev.off()
+
+#B-values
+png("~/PD_GRS/EWAS_TERRE/volcano_TERRE_PD_Bvals_44_6Dec25.png", width=350, height=250)
+ggplot(pd_res[,c("adjDB","P.Value","cat")], aes(x=adjDB, y=-log10(P.Value), colour=cat)) +
+  geom_point(size=1.75) + geom_point(data=pd_res[pd_res$cat=="TERRE_GRS_controls",],size=1.75) +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("red","gray70")) + 
+geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + ggtitle("PD Status EWAS: TERRE") + labs(colour="Category") + xlim(c(-0.2, 0.2)) + ylim(c(0,10)) + geom_hline(yintercept=-log10(0.003256027))
+dev.off()
+```
+![EWAS in controls: M-values plot](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_controls_Mvals_6Dec25.png)
+
+![EWAS in controls: B-values plot](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_controls_Bvals.png)
+
+44 probes are associated with the GRS in controls when M-values are converted to beta-values and a beta-value cutoff of 0.03 is used.
+
+
+#### Females GRS EWAS
+```{r volcano female, eval=F}
+#female_res <- read.csv("~/PD_GRS/EWAS_GRS_females.csv")
+
+# annotate topTable
+colnames(female_res)[1] <- "TargetID"
+female_res <- left_join(female_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(female_res)[2:3] <- c("delta_M", "avgM")
+write.csv(female_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_females_1Dec25.csv", row.names=F)
+
+#Volcano plot: M-values
+summary(female_res$threshold_M <- (female_res$adj.P.Val <= 0.05 & abs(female_res$delta_M)>=1.5)) #0
+female_res$DNAm_change <- "NS"
+
+max(abs(female_res$delta_M)) #1.025342
+max(-log10(female_res$P.Value)) #6.603076
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_females_Mvals_6Dec25.png", width=200, height=250)
+ggplot(female_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9.328942e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + ylim(c(0,10)) + xlim(c(-1.8,1.8)) + theme(legend.position="none")
+dev.off()
+
+#Volcano plot: B-values
+summary(female_res$threshold_B <- (female_res$adj.P.Val <= 0.05 & abs(female_res$adjDB)>=0.03)) #0
+write.csv(female_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_females_1Dec25.csv", row.names=F)
+
+max(abs(female_res$adjDB)) #[1] 0.173806
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_females_Bvals_6Dec25.png", width=200, height=250)
+ggplot(female_res[,c("adjDB","P.Value","DNAm_change")], aes(x=adjDB, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(0.003256027)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + ylim(c(0,10)) + xlim(c(-0.2,0.2)) + theme(legend.position = "none")
+dev.off()
+```
+![Updated female EWAS model: M-values](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_females_Mvals_6Dec25.png)
+
+![Updated female EWAS model: B-values](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_females_Bvals_6Dec25.png)
+
+
+#### Males GRS EWAS
+```{r volcano male, eval=F}
+#male_res <- read.csv("~/PD_GRS/EWAS_GRS_males.csv")
+
+# annotate topTable
+colnames(male_res)[1] <- "TargetID"
+male_res <- left_join(male_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(male_res)[2:3] <- c("delta_M", "avgM")
+
+#Volcano plot: M-values
+summary(male_res$threshold_M <- (male_res$adj.P.Val <= 0.05 & abs(male_res$delta_M)>=1.5)) #0
+male_res$DNAm_change <- "NS"
+
+max(abs(male_res$delta_M)) #0.8112648
+max(-log10(male_res$P.Value)) #7.229574
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_males_Mvals_6Dec25.png", width=200, height=250)
+ggplot(male_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9.328942e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + ylim(c(0,10)) + xlim(c(-1.8,1.8)) + theme(legend.position="none")
+dev.off()
+
+#Volcano plot: B-values
+summary(male_res$threshold_B <- (male_res$adj.P.Val <= 0.05 & abs(male_res$adjDB)>=0.03)) #0
+write.csv(male_res, file="~/PD_GRS/EWAS_TERRE/EWAS_GRS_males_1Dec25.csv", row.names=F)
+
+max(abs(male_res$adjDB)) #[1] 0.1074365
+
+png("~/PD_GRS/EWAS_TERRE/volcano_GRS_males_Bvals_6Dec25.png", width=200, height=250)
+ggplot(male_res[,c("adjDB","P.Value","DNAm_change")], aes(x=adjDB, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(0.003256027)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + ylim(c(0,10)) + xlim(c(-0.2,0.2)) + theme(legend.position = "none")
+dev.off()
+```
+![Updated male EWAS model: M-values](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_males_Mvals_6Dec25.png)
+
+![Updated male EWAS model: B-values](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_GRS_males_Bvals_6Dec25.png)
+
+## Differential methylation analysis with covariate adjustment, without propensity weighting
+
+```{r prs ewas no cov, eval=F}
+####### Cross-sex PRS EWAS
+# limma design matrix and linear model fit
+design_prs <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD + head_trauma + smoking + alcohol1, data = meta_matched)
+prs_fit <- lmFit(mvals, design_prs)
+prs_fit <- eBayes(prs_fit)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+prs_res <- limma::topTable(prs_fit, coef = 2, number = Inf, genelist=rownames(mvals))
+prs_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$adj.P.Val<=0.05,]) #0
+#### logFC column is the model coefficient
+
+####### Cases only
+design_prs_case <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + head_trauma + smoking + alcohol1, data = meta_matched[meta_matched$PD=="1",])
+prs_fit_case <- lmFit(mvals[,match(unlist(meta_matched[meta_sub$PD=="1","patient"]), colnames(mvals))], design_prs_case)
+prs_fit_case <- eBayes(prs_fit_case)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_case$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+case_res <- limma::topTable(prs_fit_case, coef = 2, number = Inf, genelist=rownames(mvals))
+case_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(case_res[abs(case_res$adjDB)>=0.03 & case_res$adj.P.Val<=0.05,]) #0
+
+# Controls only
+design_prs_control <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + head_trauma + alcohol1 + smoking, data = meta_matched[meta_matched$PD=="0",])
+prs_fit_control <- lmFit(mvals[,match(unlist(meta_matched[meta_matched$PD=="0","patient"]), colnames(mvals))], design_prs_control)
+prs_fit_control <- eBayes(prs_fit_control)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_control$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+control_res <- limma::topTable(prs_fit_control, coef = 2, number = Inf, genelist=rownames(mvals))
+control_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(control_res[abs(control_res$adjDB)>=0.03 & control_res$adj.P.Val<=0.05,]) #0
+
+# Males
+design_prs_male <- model.matrix(~ 1 + GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD + smoking + alcohol1 + head_trauma, data = meta_M_matched)
+prs_fit_male <- lmFit(mvals[,match(unlist(meta_M_matched[,"patient"]), colnames(mvals_M))], design_prs_male)
+# Coefficients not estimable: plate6 plate9 
+# Partial NA coefficients for 803777 probe(s)
+prs_fit_male <- eBayes(prs_fit_male)
+# Estimation of var.prior failed - set to default value
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_male$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+male_res <- limma::topTable(prs_fit_male, coef = 2, number = Inf, genelist=rownames(mvals_M))
+male_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(male_res[abs(male_res$adjDB)>=0.03 & male_res$adj.P.Val<=0.05,]) #0
+
+# Females
+design_prs_female <- model.matrix(~ 1 + GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD + smoking + alcohol1 + head_trauma, data = meta_F_matched)
+prs_fit_female <- lmFit(mvals[,match(unlist(meta_F_matched[,"patient"]), colnames(mvals_F))], design_prs_female)
+prs_fit_female <- eBayes(prs_fit_female)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_female$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+female_res <- limma::topTable(prs_fit_female, coef = 2, number = Inf, genelist=rownames(mvals))
+female_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(female_res[abs(female_res$adjDB)>=0.03 & female_res$adj.P.Val<=0.05,]) #0
+
+# save everything
+# put limma results in separate csv's and together as one RData object for ease later
+save(prs_res, control_res, case_res, male_res, female_res, file="~/PD_GRS/EWAS_TERRE/EWAS_limma_all_no_weights_6Dec25.RData")
+
+######################## Without covariate adjustment
+
+####### Cross-sex PRS EWAS
+# limma design matrix and linear model fit
+design_prs <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD, data = meta_matched)
+prs_fit <- lmFit(mvals, design_prs)
+prs_fit <- eBayes(prs_fit)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+prs_res <- limma::topTable(prs_fit, coef = 2, number = Inf, genelist=rownames(mvals))
+prs_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$adj.P.Val<=0.05,]) #0
+#### logFC column is the model coefficient
+
+####### Cases only
+design_prs_case <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A, data = meta_matched[meta_matched$PD=="1",])
+prs_fit_case <- lmFit(mvals[,match(unlist(meta_matched[meta_sub$PD=="1","patient"]), colnames(mvals))], design_prs_case)
+prs_fit_case <- eBayes(prs_fit_case)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_case$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+case_res <- limma::topTable(prs_fit_case, coef = 2, number = Inf, genelist=rownames(mvals))
+case_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(case_res[abs(case_res$adjDB)>=0.03 & case_res$adj.P.Val<=0.05,]) #0
+
+# Controls only
+design_prs_control <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A, data = meta_matched[meta_matched$PD=="0",])
+prs_fit_control <- lmFit(mvals[,match(unlist(meta_matched[meta_matched$PD=="0","patient"]), colnames(mvals))], design_prs_control)
+prs_fit_control <- eBayes(prs_fit_control)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_control$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+control_res <- limma::topTable(prs_fit_control, coef = 2, number = Inf, genelist=rownames(mvals))
+control_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(control_res[abs(control_res$adjDB)>=0.03 & control_res$adj.P.Val<=0.05,]) #0
+
+# Males
+design_prs_male <- model.matrix(~ 1 + GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD, data = meta_M_matched)
+prs_fit_male <- lmFit(mvals[,match(unlist(meta_M_matched[,"patient"]), colnames(mvals_M))], design_prs_male)
+# Coefficients not estimable: plate6 plate9 
+# Partial NA coefficients for 803777 probe(s)
+prs_fit_male <- eBayes(prs_fit_male)
+# Estimation of var.prior failed - set to default value
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_male$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+male_res <- limma::topTable(prs_fit_male, coef = 2, number = Inf, genelist=rownames(mvals_M))
+male_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(male_res[abs(male_res$adjDB)>=0.03 & male_res$adj.P.Val<=0.05,]) #0
+
+# Females
+design_prs_female <- model.matrix(~ 1 + GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD, data = meta_F_matched)
+prs_fit_female <- lmFit(mvals[,match(unlist(meta_F_matched[,"patient"]), colnames(mvals_F))], design_prs_female)
+prs_fit_female <- eBayes(prs_fit_female)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_female$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+female_res <- limma::topTable(prs_fit_female, coef = 2, number = Inf, genelist=rownames(mvals))
+female_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(female_res[abs(female_res$adjDB)>=0.03 & female_res$adj.P.Val<=0.05,]) #0
+
+# save everything
+# put limma results in separate csv's and together as one RData object for ease later
+save(prs_res, control_res, case_res, male_res, female_res, file="~/PD_GRS/EWAS_TERRE/EWAS_limma_all_no_cov_6Dec25.RData")
+```
+
+## Summary and next steps
+
+When SNPs that did not pass QC in the Nalls 2019 analysis were removed from the GRS, associations with DNAm were eliminated or dampened. No models, regardless of sex or disease stratification, had any CpGs passing M-value and adjusted p-value cutoffs. This suggested the SNPs in the GRS had little influence on DNAm compared with sex and exposures, which were correlated with DNAm PCs.
+
+
+Sample breakdown:
+
+218 total
+
+71 PD cases
+
+147 controls
+
+100 females
+
+118 males
+
+

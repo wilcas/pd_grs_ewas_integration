@@ -1,0 +1,51 @@
+---
+title: "PRS Analysis"
+output: html_notebook
+---
+
+Created Sep 12, 2022 by Will Casazza
+
+Updated Nov 15, 2025 by Samantha Schaffner: Subsetting Nalls et al. 2019 table to the 90 SNPs passing all QC filters
+
+```{r setup, include=FALSE}
+library(rcompanion)
+library(readxl)
+library(tidyverse)
+library(ggpubr)
+library(glue)
+library(data.table)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# PD risk score data and matching
+```{r eval=FALSE}
+risk_scores <- read_xlsx("~/PD_GRS/Table S2. Detailed summary statistics on all nominated risk variants, known and novel_.xlsx") %>%
+  mutate(CHR = as.numeric(CHR), COUNTED = toupper(`Effect allele`), ALT = toupper(`Other allele`), POS = BP) %>%
+  filter(!is.na(CHR)) %>% filter(`Failed final filtering and QC`==0) #90 SNPs
+risk_scores %>%
+  select(SNP, COUNTED, `Beta, all studies`) %>%
+  write_delim("~/PD_GRS/WC_scripts/prs_analyses/pd_prs_file_SS.txt", col_names = FALSE)
+```
+
+# TERRE PRS Analysis
+Generate PRS using `plink2 --score`:
+```{bash eval=FALSE}
+~/plink2 --bfile ~/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/raw_data.imputed.r2_30.hard_call.maf_mismatch\
+  --score ~/PD_GRS/WC_scripts/prs_analyses/pd_prs_file_SS.txt list-variants\
+  --out ~/PD_GRS/WC_scripts/prs_analyses/terre_prs_SS
+  
+#Warning: --score: 7 entries in
+#/home1/NEURO/schaffner/PD_GRS/WC_scripts/prs_analyses/pd_prs_file_SS.txt were
+#skipped due to missing variant IDs.  
+
+#Meaning, 7 of the PRS SNPs did not pass QC in TERRE data and were not present in the final processed file.
+
+## Checking which SNPs were not present
+vars <- read.delim("~/PD_GRS/WC_scripts/prs_analyses/terre_prs_SS.sscore.vars",header=FALSE)
+vars_excl <- risk_scores$SNP[-which(risk_scores$SNP %in% vars$V1)]  
+vars_excl
+#[1] "rs76763715"  "rs75859381"  "rs76949143"  "rs6476434"   "rs34637584"  "rs12147950"  "rs117615688"
+```
+
+
