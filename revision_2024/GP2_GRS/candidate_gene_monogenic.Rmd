@@ -1,0 +1,270 @@
+Candidate gene analysis: TERRE GRS EWAS
+===============================================================
+
+Created Feb 1, 2026 by Samantha Schaffner.
+
+Updated Feb 2, 2026 by Samantha Schaffner.
+
+## checking against monogenic PD genes (list from Lim et al., Lancet Neurol 2024)
+```{r, eval=F}
+library(limma)
+library(dplyr)
+library(lumi)
+library(ggplot2)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+load("~/kobor_shared_coding_resource/EPIC_fdat.RData")
+load("~/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/1-TERRE_RG_filtered.RData")
+nrow(mvals <- getM(PD_RG_filtered)) #803777
+fdat_TERRE <- fData_EPIC[fData_EPIC$TargetID %in% rownames(mvals),] #803777
+
+mon_genes <- read.csv("~/PD_GRS/candidate_genes/lancet_2024_monogenic_genes.csv")
+nrow(mon_genes) #15
+mon_genes$Gene[5] <- "PARK7"
+
+fdat_candidate <- lapply(1:nrow(mon_genes), function(x){
+  fdat_sub <- fdat_TERRE[grep(mon_genes$Gene[x], fdat_TERRE$UCSC_REFGENE_NAME),]
+  if (length(grep("SNCAIP",fdat_sub$UCSC_REFGENE_NAME))>0){
+    fdat_sub <- fdat_sub[-(grep("SNCAIP",fdat_sub$UCSC_REFGENE_NAME)),]
+    print(paste(nrow(fdat_sub), "probes mapping to", mon_genes$Gene[x], sep=" "))
+    return(fdat_sub) }
+  else if (length(grep("SPINK",fdat_sub$UCSC_REFGENE_NAME))>0|
+           length(grep("DDOST;PINK1-AS",fdat_sub$UCSC_REFGENE_NAME))>0){
+    fdat_sub <- fdat_sub[-(grep("SPINK",fdat_sub$UCSC_REFGENE_NAME)),]
+    fdat_sub <- fdat_sub[-(grep("DDOST;PINK1-AS",fdat_sub$UCSC_REFGENE_NAME)),]
+    print(paste(nrow(fdat_sub), "probes mapping to", mon_genes$Gene[x], sep=" "))
+    return(fdat_sub) }
+  else { 
+    print(paste(nrow(fdat_sub), "probes mapping to", mon_genes$Gene[x], sep=" "))
+    return(fdat_sub) }
+})
+#[1] "40 probes mapping to SNCA"
+#[1] "23 probes mapping to LRRK2"
+#[1] "28 probes mapping to VPS35"
+#[1] "0 probes mapping to PRKN"
+#[1] "28 probes mapping to PARK7"
+#[1] "24 probes mapping to PINK1"
+#[1] "29 probes mapping to RAB32"
+#[1] "61 probes mapping to PLA2G6"
+#[1] "49 probes mapping to ATP13A2"
+#[1] "27 probes mapping to FBXO7"
+#[1] "34 probes mapping to SYNJ1"
+#[1] "55 probes mapping to DNAJC6"
+#[1] "35 probes mapping to VPS13C"
+#[1] "0 probes mapping to PTPA"
+#[1] "48 probes mapping to DAGLB"
+fdat_candidate <- do.call(rbind, fdat_candidate)
+
+nrow(fdat_candidate) #481
+length(unique(fdat_candidate$UCSC_REFGENE_NAME)) #46
+unique(fdat_candidate$UCSC_REFGENE_NAME)
+
+nrow(mvals_sub <- mvals[rownames(mvals) %in% fdat_candidate$TargetID,]) #481
+
+meta <- read.csv("~/PD_GRS/meta_geno_DNAm_PCs_1Feb2026.csv")
+meta <- meta[complete.cases(meta$CTP_PC1),]
+mvals_sub <- mvals_sub[,match(meta$patient, colnames(mvals_sub))]
+all(colnames(mvals_sub)==meta$patient) #TRUE
+
+meta_sub <- meta[,c("patient","GRS_scaled","SCORE1_AVG","PD","age","sex","geno_V3","geno_V4","geno_V5","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","CTP_PC6","smoking","pesticides","head_trauma","alcohol1","levodopa","agonist","plate","SentrixPosition_A")]
+meta_sub$PD <- as.factor(meta_sub$PD)
+meta_sub$sex <- as.factor(meta_sub$sex)
+meta_sub$smoking <- as.factor(meta_sub$smoking)
+meta_sub$pesticides <- as.factor(meta_sub$pesticides)
+meta_sub$head_trauma <- as.factor(meta_sub$head_trauma)
+meta_sub$alcohol1 <- as.factor(meta_sub$alcohol1)
+meta_sub$levodopa <- as.factor(meta_sub$levodopa)
+meta_sub$plate <- as.factor(meta_sub$plate)
+meta_sub$SentrixPosition_A <- as.factor(meta_sub$SentrixPosition_A)
+
+#scaled GRS
+pvals_x_sex <- sapply(1:nrow(mvals_sub), function(x) {
+  coef(summary(lm(mvals_sub[x,] ~ meta_sub$GRS_scaled + meta_sub$age + meta_sub$sex + meta_sub$geno_V3 + meta_sub$geno_V4 + meta_sub$geno_V5 + meta_sub$CTP_PC1 + meta_sub$CTP_PC2 + meta_sub$CTP_PC3 + meta_sub$CTP_PC4 + meta_sub$CTP_PC5 + meta_sub$CTP_PC6 + meta_sub$plate + meta_sub$SentrixPosition_A + meta_sub$PD)))[2,4]
+   })
+source("~/kobor_shared_coding_resource/qqplot_NG.R")
+png("~/PD_GRS/candidate_genes/qqplot_mono_candidate_1Feb26.png")
+qqunif.plot(pvals_x_sex, title="Model on PD candidate CpGs")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+library(bacon)
+zvals <- qnorm(pvals_x_sex)
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 481 test-statistics.
+#...estimated bias: -0.016.
+#...estimated inflation: 0.9.
+
+
+####### Cross-sex PRS EWAS
+# limma design matrix and linear model fit
+library(limma)
+library(lumi)
+design_prs <- model.matrix(~ 1 + GRS_scaled + age + sex + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD, data = meta_sub)
+prs_fit <- lmFit(mvals_sub, design_prs)
+prs_fit <- eBayes(prs_fit)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+prs_res <- limma::topTable(prs_fit, coef = 2, number = Inf, genelist=rownames(mvals_sub))
+prs_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$adj.P.Val<=0.05,]) #0
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$P.Value<=0.05,]) #0
+
+prs_res$DNAm_change <- "NS"
+write.csv(prs_res, file="~/PD_GRS/candidate_genes/candidate_gene_mon_results.csv", row.names=F)
+min(prs_res$adj.P.Val) #[1] 0.9135645
+
+max(abs(prs_res$logFC)) #0.1184326
+max(abs(prs_res$adjDB)) #0.01220274
+max(-log10(prs_res$P.Value)) #2.163764
+
+png("~/PD_GRS/candidate_genes/volcano_candidate_mon_MVals.png", width=200, height=250)
+ggplot(prs_res[,c("logFC","P.Value","DNAm_change")], aes(x=logFC, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(0.05), linetype="dashed")  + geom_hline(yintercept=-log10(1e-7)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + xlim(c(-1.8,1.8)) + ylim(c(0,8)) + theme(legend.position="none")
+dev.off()
+
+png("~/PD_GRS/candidate_genes/volcano_candidate_mon_MVals_nolim.png", width=200, height=250)
+ggplot(prs_res[,c("logFC","P.Value","DNAm_change")], aes(x=logFC, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70"))  + xlim(c(-0.12,0.12)) + ylim(c(0,2.5)) + theme(legend.position="none")
+dev.off()
+```
+![Volcano plot: candidate CpGs (cross-sex)](/home1/NEURO/schaffner/PD_GRS/candidate_genes/volcano_candidate_mon_MVals.png)
+
+![Zoomed in volcano plot: candidate CpGs (cross-sex)](/home1/NEURO/schaffner/PD_GRS/candidate_genes/volcano_candidate_mon_MVals_nolim.png)
+
+### Males
+
+```{r m, eval=F}
+nrow(meta_M <- meta_sub[meta_sub$sex=="M",]) #118
+dim(mvals_M <- mvals_sub[,colnames(mvals_sub) %in% meta_M$patient]) #[1] 481 118
+all(colnames(mvals_M)==meta_M$patient) #TRUE
+
+#scaled GRS
+pvals_M <- sapply(1:nrow(mvals_M), function(x) {
+  coef(summary(lm(mvals_sub[x,] ~ meta_M$GRS_scaled + meta_M$age + meta_M$geno_V3 + meta_M$geno_V4 + meta_M$geno_V5 + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$PD)))[2,4]
+   })
+png("~/PD_GRS/candidate_genes/qqplot_mono_candidate_M_1Feb26.png")
+qqunif.plot(pvals_M, title="Males: Model on PD candidate CpGs")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_M)
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 481 test-statistics.
+#...estimated bias: -0.42.
+#...estimated inflation: 1.1.
+
+
+####### Males PRS EWAS
+# limma design matrix and linear model fit
+design_prs <- model.matrix(~ 1 + GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD, data = meta_M)
+prs_fit <- lmFit(mvals_M, design_prs)
+prs_fit <- eBayes(prs_fit)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+prs_res <- limma::topTable(prs_fit, coef = 2, number = Inf, genelist=rownames(mvals_M))
+prs_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$adj.P.Val<=0.05,]) #0
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$P.Value<=0.05,]) #0
+
+prs_res$DNAm_change <- "NS"
+write.csv(prs_res, file="~/PD_GRS/candidate_genes/candidate_gene_mon_M_results.csv", row.names=F)
+min(prs_res$adj.P.Val) #[1] 0.288108
+
+max(abs(prs_res$logFC)) #0.1541389
+max(abs(prs_res$adjDB)) #0.01906078
+max(-log10(prs_res$P.Value)) #3.103637
+
+png("~/PD_GRS/candidate_genes/volcano_candidate_mon_M_MVals.png", width=200, height=250)
+ggplot(prs_res[,c("logFC","P.Value","DNAm_change")], aes(x=logFC, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(0.05), linetype="dashed")  + geom_hline(yintercept=-log10(1e-7)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + xlim(c(-1.8,1.8)) + ylim(c(0,8)) + theme(legend.position="none")
+dev.off()
+
+png("~/PD_GRS/candidate_genes/volcano_candidate_mon_M_MVals_nolim.png", width=200, height=250)
+ggplot(prs_res[,c("logFC","P.Value","DNAm_change")], aes(x=logFC, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70"))  + xlim(c(-0.16,0.16)) + ylim(c(0,3.5)) + theme(legend.position="none")
+dev.off()
+```
+![Volcano plot: candidate CpGs (males)](/home1/NEURO/schaffner/PD_GRS/candidate_genes/volcano_candidate_mon_M_MVals.png)
+
+![Zoomed in volcano plot: candidate CpGs (males)](/home1/NEURO/schaffner/PD_GRS/candidate_genes/volcano_candidate_mon_M_MVals_nolim.png)
+
+
+### Females
+
+```{r f, eval=F}
+nrow(meta_F <- meta_sub[meta_sub$sex=="F",]) #100
+dim(mvals_F <- mvals_sub[,colnames(mvals_sub) %in% meta_F$patient]) #[1] 481 100
+all(colnames(mvals_F)==meta_F$patient) #TRUE
+
+#scaled GRS
+pvals_F <- sapply(1:nrow(mvals_F), function(x) {
+  coef(summary(lm(mvals_F[x,] ~ meta_F$GRS_scaled + meta_F$age + meta_F$geno_V3 + meta_F$geno_V4 + meta_F$geno_V5 + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$plate + meta_F$SentrixPosition_A + meta_F$PD)))[2,4]
+   })
+png("~/PD_GRS/candidate_genes/qqplot_mono_candidate_F_1Feb26.png")
+qqunif.plot(pvals_F, title="Females: Model on PD candidate CpGs")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals_F)
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 481 test-statistics.
+#...estimated bias: -0.016.
+#...estimated inflation: 1.
+
+
+####### Females PRS EWAS
+# limma design matrix and linear model fit
+design_prs <- model.matrix(~ 1 + GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + CTP_PC5 + CTP_PC6 + plate + SentrixPosition_A + PD, data = meta_F)
+prs_fit <- lmFit(mvals_F, design_prs)
+prs_fit <- eBayes(prs_fit)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+prs_res <- limma::topTable(prs_fit, coef = 2, number = Inf, genelist=rownames(mvals_F))
+prs_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$adj.P.Val<=0.05,]) #0
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$P.Value<=0.05,]) #0
+
+prs_res$DNAm_change <- "NS"
+write.csv(prs_res, file="~/PD_GRS/candidate_genes/candidate_gene_mon_F_results.csv", row.names=F)
+min(prs_res$adj.P.Val) #[1] 0.07320579
+
+max(abs(prs_res$logFC)) #0.1655579
+max(abs(prs_res$adjDB)) #0.02322305
+max(-log10(prs_res$P.Value)) #3.8176
+
+png("~/PD_GRS/candidate_genes/volcano_candidate_mon_F_MVals.png", width=200, height=250)
+ggplot(prs_res[,c("logFC","P.Value","DNAm_change")], aes(x=logFC, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(0.05), linetype="dashed")  + geom_hline(yintercept=-log10(1e-7)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + xlim(c(-1.8,1.8)) + ylim(c(0,8)) + theme(legend.position="none")
+dev.off()
+
+png("~/PD_GRS/candidate_genes/volcano_candidate_mon_F_MVals_nolim.png", width=200, height=250)
+ggplot(prs_res[,c("logFC","P.Value","DNAm_change")], aes(x=logFC, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70"))  + xlim(c(-0.17,0.17)) + ylim(c(0,4)) + theme(legend.position="none")
+dev.off()
+```
+![Volcano plot: candidate CpGs (females)](/home1/NEURO/schaffner/PD_GRS/candidate_genes/volcano_candidate_mon_F_MVals.png)
+
+![Zoomed in volcano plot: candidate CpGs (females)](/home1/NEURO/schaffner/PD_GRS/candidate_genes/volcano_candidate_mon_F_MVals_nolim.png)
+
+
