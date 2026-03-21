@@ -1,0 +1,283 @@
+---
+title: "DIGPD GRS: Epigenome-wide asssociation analysis"
+output: html_notebook
+---
+
+The manuscript "A Parkinson’s disease genetic risk score associates with blood DNAm on chromosome 17" explores how a genetic risk score (GRS) for Parkinson's disease (PD) associates with blood DNA methylation in the digpd study of French agricultural workers, and evaluates GRS associations with DNAm in each sex as well as their sensitivity to non-genetic factors. This was originally spearheaded by Will Casazza and was posted as a pre-print on medRxiv in 2023. The current revision (2024, led by Sam Schaffner) aims to address previous reviewer feedback and prepare the manuscript for re-submission.
+
+Last updated Feb 25, 2026 by Samantha Schaffner: Using GP2 2025 summary statistics.
+
+```{r setup, include=FALSE, eval=F}
+library(lumi)
+library(limma)
+library(minfi)
+library(rcompanion)
+library(readxl)
+library(tidyverse)
+library(ggpubr)
+library(glue)
+library(data.table)
+library(car)
+library(bacon)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+source("~/kobor_shared_coding_resource/qqplot_NG.R")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading in and preparing data
+```{r load dat, eval=FALSE}
+meta <- read.csv("~/PD_GRS/digpd_meta_geno_DNAm_PCs_22Feb26.csv")
+meta_F <- meta[meta$reportedSex%in%"F",]
+meta_F <- meta_F[,c("patient","GRS_scaled","PD","Age","GPC1","GPC2","GPC3","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","plate","SentrixPosition_A","smoking","pesticides","alcohol","levodopa","agonist","head_trauma")]
+
+### Males
+meta_M <- meta[meta$reportedSex%in%"M",]
+meta_M <- meta_M[,c("patient","GRS_scaled","PD","Age","GPC1","GPC2","GPC3","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","plate","SentrixPosition_A","smoking","pesticides","alcohol","levodopa","agonist","head_trauma")]
+```
+
+
+## PCA correlation with meta data
+
+### Females
+```{r DNAm meta pca F, eval=F}
+load("~/PD_CMRs_GxE/2-EWAS_CMRs/DIGPD/DIGPD_refCMR_medB_F_var.RData")
+
+#restructing meta data and subsetting to categorical/continuous
+rownames(refCMR_medB_F_var) <- sapply(1:nrow(refCMR_medB_F_var), function(x) unlist(strsplit(rownames(refCMR_medB_F_var)[x], split="\\."))[1])
+nrow(digpd_F <- meta_F[meta_F$patient %in% rownames(refCMR_medB_F_var),]) #93
+digpd_F <- digpd_F[match(rownames(refCMR_medB_F_var), digpd_F$patient),]
+str(digpd_F)
+digpd_F$PD <- as.factor(digpd_F$PD)
+digpd_F$smoking <- as.factor(digpd_F$smoking)
+digpd_F$pesticides <- as.factor(digpd_F$pesticides)
+digpd_F$head_trauma <- as.factor(digpd_F$head_trauma)
+digpd_F$alcohol <- as.factor(digpd_F$alcohol)
+digpd_F$levodopa <- as.factor(digpd_F$levodopa)
+digpd_F$agonist <- as.factor(digpd_F$agonist)
+digpd_F$plate <- as.factor(digpd_F$plate)
+digpd_F$SentrixPosition_A <- as.factor(digpd_F$SentrixPosition_A)
+rownames(digpd_F) <- digpd_F$patient
+
+meta_categorical <- digpd_F[,c("PD","smoking","pesticides","head_trauma","alcohol","levodopa","agonist","plate","SentrixPosition_A")]
+meta_continuous <- digpd_F[,c("GRS_scaled","Age","GPC1","GPC2","GPC3","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(rownames(refCMR_medB_F_var), rownames(meta_categorical)) #TRUE
+
+#PCA on M-values: input
+PCA_full<-princomp(t(refCMR_medB_F_var))
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/pca_CMRs_F_scree_1Mar26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/pca_CMRs_F_heat_1Mar26.png)
+
+### Males
+```{r DNAm meta pca M, eval=F}
+load("~/PD_CMRs_GxE/2-EWAS_CMRs/DIGPD/DIGPD_refCMR_medB_M_var.RData")
+
+#restructing meta data and subsetting to categorical/continuous
+rownames(refCMR_medB_M_var) <- sapply(1:nrow(refCMR_medB_M_var), function(x) unlist(strsplit(rownames(refCMR_medB_M_var)[x], split="\\."))[1])
+nrow(digpd_M <- meta_M[meta_M$patient %in% rownames(refCMR_medB_M_var),]) #129
+digpd_M <- digpd_M[match(rownames(refCMR_medB_M_var), digpd_M$patient),]
+str(digpd_M)
+digpd_M$PD <- as.factor(digpd_M$PD)
+digpd_M$smoking <- as.factor(digpd_M$smoking)
+digpd_M$pesticides <- as.factor(digpd_M$pesticides)
+digpd_M$head_trauma <- as.factor(digpd_M$head_trauma)
+digpd_M$alcohol <- as.factor(digpd_M$alcohol)
+digpd_M$levodopa <- as.factor(digpd_M$levodopa)
+digpd_M$agonist <- as.factor(digpd_M$agonist)
+digpd_M$plate <- as.factor(digpd_M$plate)
+digpd_M$SentrixPosition_A <- as.factor(digpd_M$SentrixPosition_A)
+rownames(digpd_M) <- digpd_M$patient
+
+meta_categorical <- digpd_M[,c("PD","smoking","pesticides","head_trauma","alcohol","levodopa","agonist","plate","SentrixPosition_A")]
+meta_continuous <- digpd_M[,c("GRS_scaled","Age","GPC1","GPC2","GPC3","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(rownames(refCMR_medB_M_var), rownames(meta_categorical)) #TRUE
+
+#PCA on M-values: input
+PCA_Full<-princomp(t(refCMR_medB_M_var))
+
+PCA_Plot(PCA_Full, type="sparse", MTC=T, Discrete=T)
+```
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/PCA_CMRs_M_scree_1Mar26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/pca_CMRs_M_heat_1Mar26.png)
+
+
+# Association analysis
+
+## EWAS model checks
+
+Prior to looking at results, I'll assess whether the new EWAS model seems appropriate using three measures:
+
+*1. Variance inflation factor*: The variance inflation factor (VIF) can be used to detect collinearity. Higher VIF values indicate a greater degree of collinearity. Typically VIF < 5 is considered acceptable.
+
+
+*2. Q-Q plot of nominal p-values*: If the variable of interest does not affect global DNAm, p-values should distribute close to the center line on a normal Q-Q plot, with some deviation at the tail indicating associations detected. The shape of the Q-Q plot can visually indicate model inflation or deflation.
+
+
+*3. Bias and inflation calculations*: The "bacon" package (van Iterson et al., 2017) was developed to calculate and optionally, correct for, bias and inflation observed in epigenome-wide association studies. It models test statistics using a Bayesian mixture model, and estimates the model parameters: bias (mean) and inflation (standard deviation). The Bayesian mixture model is proposed to more accurately model the quantitative nature and technical/biological influences on epigenomic and transcriptomic data, as opposed to the traditional genomic inflation factor (based on discrete genotypes).
+
+
+## Females
+
+### With adjustment for environmental covariates
+```{r digpd models F unadj, eval=F}
+all(digpd_F$patient==rownames(refCMR_medB_F_var)) #TRUE
+
+# VIF
+sapply(vif(lm(refCMR_medB_F_var[,1] ~ digpd_F$GRS_scaled + digpd_F$PD + digpd_F$Age + digpd_F$CTP_PC1 + digpd_F$CTP_PC2 + digpd_F$CTP_PC3 + digpd_F$CTP_PC4 + digpd_F$CTP_PC5 + digpd_F$GPC1 + digpd_F$GPC2 + digpd_F$GPC3 + digpd_F$SentrixPosition_A))[,3], function(x) x^2)
+#       digpd_F$GRS_scaled                digpd_F$PD               digpd_F$Age           digpd_F$CTP_PC1 
+#                 1.262096                  2.246892                  1.407272                  1.399636 
+#          digpd_F$CTP_PC2           digpd_F$CTP_PC3           digpd_F$CTP_PC4           digpd_F$CTP_PC5 
+#                 1.269745                  1.205386                  1.256477                  1.121071 
+#             digpd_F$GPC1              digpd_F$GPC2              digpd_F$GPC3 digpd_F$SentrixPosition_A 
+#                 1.174152                  1.376410                  1.563247                  1.220918 
+
+library(MASS)
+library(sfsmisc)
+rlm_pvals_F <- lapply(1:ncol(refCMR_medB_F_var), function(x) {
+ RLM <- rlm(refCMR_medB_F_var[,x] ~ digpd_F$GRS_scaled + digpd_F$PD + digpd_F$Age + digpd_F$plate + digpd_F$SentrixPosition_A + digpd_F$CTP_PC1 + digpd_F$CTP_PC2 + digpd_F$CTP_PC3 + digpd_F$CTP_PC4 + digpd_F$CTP_PC5 + digpd_F$GPC1 + digpd_F$GPC2 + digpd_F$GPC3, psi = psi.huber, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+png("~/PD_GRS/EWAS_DIGPD/qqplot_CMRs_F_unadj_1Mar26.png")
+qqunif.plot(unlist(rlm_pvals_F), title="EWAS on reference CMRs: Females")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(unlist(rlm_pvals_F))
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 29166 test-statistics.
+#...estimated bias: 0.044.
+#...estimated inflation: 0.97.
+
+results.F <- as.data.frame(do.call(rbind, rlm_pvals_F))
+rownames(results.F) <- colnames(refCMR_medB_F_var)
+names(results.F)[1] <- "pval"
+results.F$adjP_BH <- p.adjust(results.F$pval, method="BH")
+results.F$TargetID <- rownames(results.F)
+
+coefs_F <- lapply(1:ncol(refCMR_medB_F_var), function(x) {
+ rlm(refCMR_medB_F_var[,x] ~ digpd_F$GRS_scaled + digpd_F$PD + digpd_F$Age + digpd_F$plate + digpd_F$SentrixPosition_A + digpd_F$CTP_PC1 + digpd_F$CTP_PC2 + digpd_F$CTP_PC3 + digpd_F$CTP_PC4 + digpd_F$CTP_PC5 + digpd_F$GPC1 + digpd_F$GPC2 + digpd_F$GPC3, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(names(coefs_F)==rownames(results.F)) #TRUE
+results.F$adjDB <- unlist(coefs_F)
+
+#how many sites pass DB 0.03 and FDR 0.05 with BH multiple test correction?
+summary(results.F$threshold_adjDB <- (results.F$adjP_BH <= 0.05 & abs(results.F$adjDB) >= 0.03)) #1
+results.F$DNAm_change <- "NS"
+results.F[results.F$threshold_adjDB==TRUE,"adjDB"] #-0.0782241
+results.F[results.F$threshold_adjDB==TRUE,"DNAm_change"] <- "Decrease"
+
+#getting gene annotations from PD CMRs EWAS
+results.F.v1 <- read.csv("~/PD_CMRs_GxE/2-EWAS_CMRs/DIGPD/rlm_F_anno.csv")
+all(results.F.v1$TargetID==results.F$TargetID) #TRUE
+results.F <- cbind(results.F, results.F.v1[,8:64])
+
+results.F[results.F$threshold_adjDB==TRUE,c("adjDB","pval","DNAm_change","geneSymbol")]
+#                adjDB         pval DNAm_change geneSymbol
+#cg15729578 -0.0782241 3.643939e-07    Decrease       <NA>
+
+write.csv(results.F, file="~/PD_GRS/EWAS_DIGPD/EWAS_CMRs_F_unadj_1Mar26.csv", row.names=F)
+
+#Volcano plot
+max(abs(results.F$adjDB)) #0.0782241
+max(-log10(results.F$pval)) #6.438429
+
+png("~/PD_GRS/EWAS_DIGPD/volcano_CMRs_F_unadj_1Mar26.png", width=200, height=250)
+ggplot(results.F[,c("adjDB","pval","DNAm_change","cmrGR")], aes(x=adjDB, y=-log10(pval), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") + scale_colour_manual(values=c("lightpink4","gray70"))+
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic()+ geom_hline(yintercept=-log10(5e-7)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + xlim(c(-0.1,0.1)) + ylim(c(0,7.5)) + theme(legend.position="none")+
+    geom_label_repel(data = results.F[results.F$threshold_adjDB==TRUE,c("adjDB","pval","DNAm_change","cmrGR")],
+            aes(label = cmrGR), size = 4, force = 20, max.overlaps=16,position = position_nudge_repel(x = 0.1, y = 0.2))
+dev.off()
+
+#large sized, for manuscript figure
+png("~/PD_GRS/EWAS_DIGPD/volcano_CMRs_F_unadj_large_8Mar26.png", width=400, height=500)
+ggplot(results.F[,c("adjDB","pval","DNAm_change","cmrGR")], aes(x=adjDB, y=-log10(pval), colour=DNAm_change)) +
+  geom_point(size=3) +
+  labs(legend.position = "none") + scale_colour_manual(values=c("lightpink4","gray70"))+
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic()+ geom_hline(yintercept=-log10(5e-7)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + xlim(c(-0.1,0.1)) + ylim(c(0,7.5)) + theme(legend.position="none",axis.title.x = element_text(size = 20),axis.title.y = element_text(size = 20),axis.text.x = element_text(size = 15),axis.text.y = element_text(size = 15))+
+    geom_label_repel(data = results.F[results.F$threshold_adjDB==TRUE,c("adjDB","pval","DNAm_change","cmrGR")],
+            aes(label = cmrGR), size = 7, force = 20, max.overlaps=16,position = position_nudge_repel(x = 0.1, y = 0.2))
+dev.off()
+```
+![Female EWAS model, without environmental covariates](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/qqplot_CMRs_F_unadj_1Mar26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/volcano_CMRs_F_unadj_1Mar26.png)
+
+## Males
+
+### With adjustment for environmental covariates
+```{r digpd models M unadj, eval=F}
+all(digpd_M$patient==rownames(refCMR_medB_M_var)) #TRUE
+
+# VIF
+sapply(vif(lm(refCMR_medB_M_var[,1] ~ digpd_M$GRS_scaled + digpd_M$PD + digpd_M$Age + digpd_M$CTP_PC1 + digpd_M$CTP_PC2 + digpd_M$CTP_PC3 + digpd_M$CTP_PC4 + digpd_M$CTP_PC5 + digpd_M$GPC1 + digpd_M$GPC2 + digpd_M$GPC3 + digpd_M$SentrixPosition_A))[,3], function(x) x^2)
+#       digpd_M$GRS_scaled                digpd_M$PD               digpd_M$Age           digpd_M$CTP_PC1 
+#                 1.194549                  2.394720                  1.358701                  1.158196 
+#          digpd_M$CTP_PC2           digpd_M$CTP_PC3           digpd_M$CTP_PC4           digpd_M$CTP_PC5 
+#                 1.378092                  1.225893                  1.110884                  1.164917 
+#             digpd_M$GPC1              digpd_M$GPC2              digpd_M$GPC3 digpd_M$SentrixPosition_A 
+#                 1.264990                  1.270606                  1.139321                  1.214756 
+
+#moderate multicollinearity with PD status
+
+rlm_pvals_M <- lapply(1:ncol(refCMR_medB_M_var), function(x) {
+ RLM <- rlm(refCMR_medB_M_var[,x] ~ digpd_M$GRS_scaled + digpd_M$PD + digpd_M$Age + digpd_M$plate + digpd_M$SentrixPosition_A + digpd_M$CTP_PC1 + digpd_M$CTP_PC2 + digpd_M$CTP_PC3 + digpd_M$CTP_PC4 + digpd_M$CTP_PC5 + digpd_M$GPC1 + digpd_M$GPC2 + digpd_M$GPC3, psi = psi.huber, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+png("~/PD_GRS/EWAS_DIGPD/qqplot_CMRs_M_unadj_1Mar26.png")
+qqunif.plot(unlist(rlm_pvals_M), title="EWAS on reference CMRs: Males")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(unlist(rlm_pvals_M))
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 28569 test-statistics.
+#...estimated bias: 0.037.
+#...estimated inflation: 0.98.
+
+results.M <- as.data.frame(do.call(rbind, rlm_pvals_M))
+rownames(results.M) <- colnames(refCMR_medB_M_var)
+names(results.M)[1] <- "pval"
+results.M$adjP_BH <- p.adjust(results.M$pval, method="BH")
+results.M$TargetID <- rownames(results.M)
+
+coefs_M <- lapply(1:ncol(refCMR_medB_M_var), function(x) {
+ rlm(refCMR_medB_M_var[,x] ~ digpd_M$GRS_scaled + digpd_M$PD + digpd_M$Age + digpd_M$plate + digpd_M$SentrixPosition_A + digpd_M$CTP_PC1 + digpd_M$CTP_PC2 + digpd_M$CTP_PC3 + digpd_M$CTP_PC4 + digpd_M$CTP_PC5 + digpd_M$GPC1 + digpd_M$GPC2 + digpd_M$GPC3, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(names(coefs_M)==rownames(results.M)) #TRUE
+results.M$adjDB <- unlist(coefs_M)
+
+#how many sites pass DB 0.03 and FDR 0.05 with BH multiple test correction?
+summary(results.M$threshold_adjDB <- (results.M$adjP_BH <= 0.05 & abs(results.M$adjDB) >= 0.03)) #0
+write.csv(results.M, file="~/PD_GRS/EWAS_DIGPD/EWAS_CMRs_M_unadj_1Mar26.csv", row.names=F)
+
+#Volcano plot
+max(abs(results.M$adjDB)) #0.05155266
+max(-log10(results.M$pval)) #4.06849
+
+png("~/PD_GRS/EWAS_DIGPD/volcano_CMRs_M_unadj_1Mar26.png", width=200, height=250)
+ggplot(results.M[,c("adjDB","pval")], aes(x=adjDB, y=-log10(pval), colour="gray70")) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") + scale_colour_manual(values="gray70")+
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic()+ geom_hline(yintercept=-log10(5e-7))  + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + xlim(c(-0.1,0.1)) + ylim(c(0,7.5)) + theme(legend.position="none")
+dev.off()
+```
+![Male EWAS model, without environmental covariates](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/qqplot_CMRs_M_unadj_1Mar26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/volcano_CMRs_M_unadj_1Mar26.png)
+
+There is no differential methylation related to the GRS in males.

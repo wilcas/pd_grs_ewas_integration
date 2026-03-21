@@ -1,0 +1,237 @@
+---
+title: "TERRE and DIG-PD Meta data summary table"
+output: html_notebook
+---
+
+The manuscript "A Parkinson’s disease genetic risk score associates with blood DNAm on chromosome 17" explores how a genetic risk score (GRS) for Parkinson's disease (PD) associates with blood DNA methylation in the TERRE study of French agricultural workers, and evaluates GRS associations with DNAm in each sex as well as their sensitivity to non-genetic factors. This was originally spearheaded by Will Casazza and was posted as a pre-print on medRxiv in 2023. The current revision (2024-2025, led by Sam Schaffner) aims to address previous reviewer feedback and prepare the manuscript for re-submission.
+
+
+This script generates a summary table of demographics for the TERRE and DIG-PD samples (to be "Table 1" of the manuscript).
+
+
+Last updated Mar 1, 2025 by Samantha Schaffner
+
+
+Based on code by Will Casazza
+
+
+## Libraries
+```{r setup, eval=F}
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(table1)
+library(boot)
+```
+
+# TERRE data
+```{r load data, eval=F}
+load("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/1-TERRE_RG_filtered.RData") # PD_RG_filtered
+
+mvals_combat <- minfi::getM(PD_RG_filtered)
+(covars <- fread("/home1/NEURO/SHARE_DECIPHER/terre_meta_master.csv"))
+covars$IID <- gsub("_PAE.*", "", covars$IID)
+prs_mat <- fread("~/SHARE_DECIPHER/pd_grs_ewas_integration/prs_analyses/prsice_data/TERRE_PRSice.all_score")
+
+# filtering
+covars <- covars[patient %in% colnames(mvals_combat) & IID %in% prs_mat$IID]
+prs_mat <- prs_mat[IID %in% covars$IID]
+mvals_combat <- mvals_combat[, colnames(mvals_combat) %in% covars$patient]
+
+# matching
+covars <- covars[match(patient, colnames(mvals_combat))]
+colnames(mvals_combat) <- covars$IID[match(covars$patient, colnames(mvals_combat))]
+prs_mat <- prs_mat[match(IID, colnames(mvals_combat))]
+
+
+computed_covars <- fread("~/SHARE_DECIPHER/pd_grs_ewas_integration/prs_analyses/prsice_data/TERRE.covariate")[IID %in% colnames(mvals_combat)]
+
+
+all(covars$IID == computed_covars$IID)
+covars <- cbind(covars[, -c("age", "men")], prs_mat[, .(SCORE1_AVG = `Pt_5e-08`)], computed_covars)
+#SS 1Mar2025: add in ethnicity for OR table (re-coding)
+covars$race1 <- gsub(1, "White", gsub(6, "North_African", covars$race1))
+covars <- covars[, .(SCORE1_AVG, age, alcohol = ifelse(alcohol1 > 2, 1, 0), smoking = ifelse(smoking > 1, 1, 0), pesticides = ifelse(pesticides_work == 1, "Occupational", ifelse(pesticides_domestic == 1, "Domestic", "None")), PD=status, GPC1 = V3, GPC2 = V4, GPC3 = V5, PC1, PC2, PC3, PC4, PC5, PC6, PC7, PC8, PC9, PC10, head_trauma = head_trauma_loc, sex,IID,race1)]
+
+#SS 23Feb2025: add in new EWAS covariates
+rev_meta <- read.csv("~/PD_GRS/meta_geno_DNAm_PCs.csv")
+all(rev_meta$IID==prs_mat$IID) #TRUE
+all(rev_meta$IID==computed_covars$IID) #TRUE
+covars2 <- cbind(covars, rev_meta[,c(42,44,132:137)])
+
+all(covars2$IID == prs_mat$IID)
+all(prs_mat$IID == colnames(mvals_combat))
+```
+
+## Calculate odds ratios
+Odds ratios for each demographic characteristic will be computed here with respect to a model containing all other table covariates.
+```{r or, eval=F}
+get_or_covariate <- function(dat){
+  reg <- summary(glm(PD ~ .,family="binomial", data=dat))
+  coef.quantiles <- (reg$coefficients[-c(1), 1])
+  ci <- (1.96 * reg$coefficients[-c(1), 2])
+  ci.quantiles.u <- exp(coef.quantiles + ci)
+  ci.quantiles.l <- exp(coef.quantiles - ci)
+  coef.quantiles <- exp(coef.quantiles)
+  to_plot <- data.frame(Coef = coef.quantiles, CI.U = ci.quantiles.u, CI.L = ci.quantiles.l,p.value = reg$coefficients[-c(1),4])
+  return(to_plot)
+}
+make_quantiles <- function(prs_var,prsice_data,covariate,num_quant=5){
+  prsice_data$prs_var <- prsice_data[,..prs_var]
+  quant_data <- cbind(prsice_data[,.(prs_var)],covariate) %>%
+      mutate(quant=factor(
+        cut(prs_var,
+            labels = F,
+            breaks=unique(quantile(prs_var,num_quant,probs = seq(0,1,1/num_quant))),
+            include.lowest=T
+          )
+      )) %>% dplyr::select(-prs_var)
+  return(quant_data)
+}
+get_quantiles <- function(prs_var,prsice_data,covariate,num_quant=5){
+  prsice_data$prs_var <- prsice_data[,..prs_var]
+  quant_data <- cbind(prsice_data[,.(prs_var)],covariate) %>%
+      mutate(quant=factor(
+        cut(prs_var,
+            labels = F,
+            breaks=unique(quantile(prs_var,num_quant,probs = seq(0,1,1/num_quant))),
+            include.lowest=T
+          )
+      )) %>% dplyr::select(-prs_var)
+  reg <- summary(glm(PD ~quant+., family=binomial,data=quant_data))
+  coef.quantiles <- (reg$coefficients[1:num_quant, 1])
+  ci <- (1.96 * reg$coefficients[1:num_quant, 2])
+  ci.quantiles.u <- exp(coef.quantiles + ci)
+  ci.quantiles.l <- exp(coef.quantiles - ci)
+  coef.quantiles <- exp(coef.quantiles)
+  coef.quantiles[1] <- 1
+  ci.quantiles.u[1] <- 1
+  ci.quantiles.l[1] <- 1
+  quantiles.for.table <- factor(levels(quant_data$quant),levels(quant_data$quant))
+  to_plot <- data.frame(Coef = coef.quantiles, CI.U = ci.quantiles.u, CI.L = ci.quantiles.l, DEC = quantiles.for.table)
+  return(to_plot)
+}
+
+#SS 23Feb2025: Changed "Pt_0.00030005" to "Pt_5e-08" for the below 2 calculations
+# OR independent of demographic summary covariates
+
+# subset to 218 w/complete data used in EWAS
+covars2 <- covars2[complete.cases(covars2$CTP_PC1),]
+covars <- covars[covars$IID %in% covars2$IID,]
+prs_mat <- prs_mat[prs_mat$IID %in% covars2$IID,]
+
+or_w_grs <- make_quantiles("Pt_5e-08",prs_mat,covars[,.(PD,sex,age,alcohol,smoking,pesticides=addNA(factor(pesticides,levels=c("None","Domestic","Occupational"))),head_trauma,race1)],4)
+or_estimates <- get_or_covariate(or_w_grs)
+
+# quantiles with EWAS covariates
+#SS 23Feb2025: Updated EWAS covariates to reflect revision
+#1Mar2025: adding race
+summary(covars2)
+covars2$SentrixPosition_A <- as.factor(covars2$SentrixPosition_A)
+covars2$race1 <- as.factor(covars2$race1)
+cross_quant <- get_quantiles("Pt_5e-08",prs_mat,covars2[,.(PD,age,sex,GPC1,GPC2,GPC3,CTP_PC1,CTP_PC2,CTP_PC3,CTP_PC4,CTP_PC5,CTP_PC6,plate,SentrixPosition_A,race1)]) %>% mutate(Sex = "Cross-sex", Threshold="best")
+
+my.render.cont <- function(x) {
+  with(stats.apply.rounding(stats.default(x), digits = 2), c("",
+    "Mean (SD)" = sprintf("%s (&plusmn; %s)", MEAN, SD)
+  ))
+}
+my.render.cat <- function(x) {
+  c("", sapply(stats.default(x), function(y) {
+    with(
+      y,
+      sprintf("%d (%0.0f %%)", FREQ, PCT)
+    )
+  }))
+}
+
+covars_table <- or_w_grs[, .(quant,sex, age, head_trauma, smoking, pesticides = recode(pesticides,"Missing"="NA"), alcohol, PD, race1)] %>% mutate(
+  PD = factor(PD, levels = c(1, 0), labels = c("Case", "Control")),
+  head_trauma = factor(head_trauma, levels = c(0, 1), labels = c("Absent", "Present")),
+  smoking = factor(smoking, levels = c(1, 0), labels = c("Smoker", "Non-smoker")),
+  alcohol = factor(alcohol,levels=c(1,0),labels=c("Regular consumption","No consumption")),
+  pesticides = factor(pesticides, levels = c("Occupational", "Domestic", "Missing")),
+  sex = factor(sex, levels = c(1, 0), labels = c("Male", "Female")),
+  race1 = factor(race1, levels=c("White","North_African")),
+  quant = factor(quant,levels=c(1,2,3,4),labels =c("Quartile 1","Quartile 2", "Quartile 3", "Quartile 4"))
+)
+
+labels <- list(
+  variables = list(
+    sex = "Sex",
+    age = "Age (years)",
+    smoking = "Smoking status",
+    alcohol = "Alcohol consumption",
+    pesticides = "Pesticide exposure",
+    head_trauma = "Prior head injury",
+    quant = "GRS Quartile",
+    race1 = "Self-reported race"
+  ),
+  groups = list("", "Parkinson's Status")
+)
+strata <- c(list(Total = covars_table), split(covars_table, covars_table$PD))
+(finished_table <- table1(
+  strata,
+  labels,
+  render.continuous = my.render.cont,
+  render.categorical = my.render.cat,
+  extra.col = list("Odds Ratio [95% CI]"=function(x,...){},"P-value"=function(x,...){})
+  )
+)
+```
+
+
+# DIG-PD data
+
+```{r digpd table, eval=F}
+prsice_data_digpd <- fread("~/SHARE_DECIPHER/pd_grs_ewas_integration/prs_analyses/prsice_data/DIGPD_PRSice.all_score")
+
+# SS 23Feb2025: get the rest of covariates from meta data table (do not have access to WC's "genotype_qc" folder)
+digpd_meta <- read.csv("~/PD_GRS/digpd_meta_geno_DNAm_PCs.csv")
+# fix IID format for DIGPD controls
+digpd_meta$IID <- gsub("PAL_[0-9]*_", "", digpd_meta$IID)
+all(digpd_meta$IID %in% prsice_data_digpd$IID) #TRUE
+# subset to 222 with matched DNAm and genotype
+prsice_data_digpd <- prsice_data_digpd[match(digpd_meta$IID, prsice_data_digpd$IID),]
+
+# sex: 1 = M, 0 = F
+digpd_meta2 <- data.table(digpd_meta)
+pre_table_data <- digpd_meta2[,.(IID,age, alcohol = ifelse(alcohol > 2, 1, 0), smoking = ifelse(smoking > 1, 1, 0), pesticides = ifelse(pesticides == 2, "Occupational", ifelse(pesticides== 1, "Domestic", "None")), PD, head_trauma, sex, ethnicity)]
+
+prsice_data_digpd <- prsice_data_digpd[pre_table_data,on="IID",nomatch=0]
+pre_table_data <- pre_table_data[na.omit(match(prsice_data_digpd$IID,IID))]
+all(pre_table_data$IID == prsice_data_digpd$IID)
+```
+
+## Calculate odds ratios
+```{r or digpd, eval=F}
+quantile_data_digpd <- make_quantiles("Pt_5e-08",prsice_data_digpd,pre_table_data[,.(PD,sex,age,alcohol,smoking,pesticides=addNA(factor(pesticides,levels=c("None","Domestic","Occupational"))),head_trauma,ethnicity)],4)
+covars_table <- quantile_data_digpd[, .(quant,sex, age, head_trauma, smoking, pesticides = recode(pesticides,"Missing"="NA"), alcohol, PD,ethnicity)] %>% mutate(
+  PD = factor(PD, levels = c(1, 0), labels = c("Case", "Control")),
+  head_trauma = factor(head_trauma, levels = c(0, 1), labels = c("Absent", "Present")),
+  smoking = factor(smoking, levels = c(1, 0), labels = c("Smoker", "Non-smoker")),
+  alcohol = factor(alcohol,levels=c(1,0),labels=c("Regular consumption","No consumption")),
+  pesticides = factor(pesticides, levels = c("Occupational", "Domestic")),
+  sex = factor(sex, levels = c(1, 0), labels = c("Male", "Female")),
+  ethnicity = factor(ethnicity, levels=c("Caucasian","North_African","Other")),
+  quant = factor(quant,levels=c(1,2,3,4),labels =c("Quartile 1","Quartile 2", "Quartile 3", "Quartile 4"))
+)
+or_table_digpd <- get_or_covariate(quantile_data_digpd[,.(PD,sex,age,quant)])
+
+labels <- list(
+  variables = list(
+    sex = "Sex",
+    age = "Age (years)",
+    smoking = "Smoking status",
+    alcohol = "Alcohol consumption",
+    pesticides = "Pesticide exposure",
+    head_trauma = "Prior head injury",
+    quant = "GRS Quartile",
+    ethnicity = "Self-reported race"
+  ),
+  groups = list("", "Parkinson's Status")
+)
+
+strata <- c(list(Total=covars_table),split(covars_table,covars_table$PD))
+(finished_table_digpd <- table1(strata,labels,render.continuous=my.render.cont, render.categorical=my.render.cat, extra.col = list("Odds Ratio [95% CI]"=function(x,...){},"P-value"=function(x,...){})))
+```

@@ -1,0 +1,457 @@
+---
+title: "DIGPD GRS: Epigenome-wide asssociation analysis"
+output: html_notebook
+---
+
+The manuscript "A Parkinson’s disease genetic risk score associates with blood DNAm on chromosome 17" explores how a genetic risk score (GRS) for Parkinson's disease (PD) associates with blood DNA methylation in the TERRE study of French agricultural workers, and evaluates GRS associations with DNAm in each sex as well as their sensitivity to non-genetic factors. This was originally spearheaded by Will Casazza and was posted as a pre-print on medRxiv in 2023. The current revision (2024, led by Sam Schaffner) aims to address previous reviewer feedback and prepare the manuscript for re-submission.
+
+
+In this script, EWAS is conducted to identify DNAm patterns associated with the GRS in the cross-sex and sex-stratified samples in DIGPD. The models are adjusted for batch, cell type, and disease status. Results will be compared with the previous models (adjusted for 10 DNAm PCs).
+
+
+Last updated Mar 8, 2026 by Samantha Schaffner: Including PCA plots.
+
+Based on code by Will Casazza
+
+```{r setup, include=FALSE, eval=F}
+library(lumi)
+library(limma)
+library(minfi)
+library(rcompanion)
+library(readxl)
+library(tidyverse)
+library(ggpubr)
+library(glue)
+library(data.table)
+library(car)
+library(bacon)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+source("~/kobor_shared_coding_resource/qqplot_NG.R")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Loading in and preparing data
+```{r load dat, eval=FALSE}
+# Join together meta data
+digpd_pcs <- read.delim("~/SHARE_DECIPHER/pd_grs_ewas_integration/prs_analyses/DIGPD.covariate")
+digpd_prs <- read.delim("~/PD_GRS/WC_scripts/prs_analyses/digpd_prs_gp2_2025.sscore")
+DIGPD_IDs_cases <- read.table("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/sampleInfo_revised/CORRESPONDANCES_digpd_cases.txt", header=TRUE)
+DIGPD_IDs_ctrls <- read.table("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/sampleInfo_revised/CORRESPONDANCES_digpd_controls.txt", header=TRUE)
+digpd_F <- read.csv("~/SHARE_DECIPHER/processed_DNAm_data/2022/DIGPD_processed_2022/3-digpd_meta_visit1_F_logit_matched.csv")
+digpd_M <- read.csv("~/SHARE_DECIPHER/processed_DNAm_data/2022/DIGPD_processed_2022/3-digpd_meta_visit1_M_logit_matched.csv")
+
+digpd_geno <- left_join(digpd_pcs, digpd_prs, by="IID")
+colnames(DIGPD_IDs_cases) <- colnames(DIGPD_IDs_ctrls)
+IDs <- rbind(DIGPD_IDs_cases, DIGPD_IDs_ctrls)
+colnames(IDs)[c(1,3)] <- c("patient","IID")
+all(digpd_geno$IID %in% IDs$IID) #FALSE
+head(digpd_geno$IID[-which(digpd_geno$IID %in% IDs$IID)])
+#[1] "PAL_12770" "PAL_5053"  "PAL_8463"  "PAL_32706" "PAL_2739"  "PAL_3208" 
+head(IDs$IID[grep("PAL",IDs$IID)])
+# "PAL_88_PAL_88"   "PAL_89_PAL_89"   "PAL_220_PAL_220" "PAL_332_PAL_332" "PAL_463_PAL_463" "PAL_555_PAL_555"
+
+#fix IID format
+digpd_geno$IID <- unlist(sapply(1:nrow(digpd_geno), function(x){
+  if (length(grep("PAL",digpd_geno$IID[x]))>0){
+    digpd_geno$IID[x] <- paste(digpd_geno$IID[x], digpd_geno$IID[x], sep="_")
+  } else { digpd_geno$IID[x] <- digpd_geno$IID[x] } }))
+all(digpd_geno$IID %in% IDs$IID) #TRUE
+
+digpd_geno <- left_join(digpd_geno, IDs[,c(1,3)], by="IID")
+digpd_F$reportedSex <- "F"
+digpd_M$reportedSex <- "M"
+digpd_meta <- rbind(digpd_F, digpd_M)
+all(digpd_meta$patient %in% digpd_geno$patient) #TRUE
+nrow(digpd_meta <- left_join(digpd_meta, digpd_geno, by="patient")) #222
+# cleaning up - remove blank column, duplicate geno PCs
+digpd_meta <- digpd_meta[,-c(1,48:57)]
+write.csv(digpd_meta, file="~/PD_GRS/digpd_meta_geno_DNAm_PCs_22Feb26.csv", row.names=F)
+rm(digpd_pcs, digpd_prs, digpd_geno, digpd_F, digpd_M, DIGPD_IDs_cases, DIGPD_IDs_ctrls, IDs)
+
+# DNAm data (2022, most recent QC'ed, same as npj PD 2024 article)
+digpd_meta <- read.csv("~/PD_GRS/digpd_meta_geno_DNAm_PCs_22Feb26.csv")
+load("~/SHARE_DECIPHER/processed_DNAm_data/2022/DIGPD_processed_2022/1-DIGPD_RG_filtered.RData")
+mvals <- getM(DIGPD_RG_filtered)
+rm(DIGPD_RG_filtered)
+```
+
+## PCA correlation with meta data
+```{r DNAm meta pca, eval=F}
+## Preparing data
+# match meta data and M-values
+mvals <- mvals[,match(digpd_meta$Sample_Name, colnames(mvals))]
+all(colnames(mvals)==digpd_meta$Sample_Name) #TRUE
+
+# subset meta data to relevant columns and re-format
+meta_sub <- digpd_meta[,c("Sample_Name","GRS_scaled","PD","Age","reportedSex","GPC1","GPC2","GPC3","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","smoking","pesticides","head_trauma","alcohol","levodopa","agonist","plate","SentrixPosition_A")]
+str(meta_sub)
+meta_sub$PD <- as.factor(meta_sub$PD)
+meta_sub$reportedSex <- as.factor(meta_sub$reportedSex)
+meta_sub$smoking <- as.factor(meta_sub$smoking)
+meta_sub$pesticides <- as.factor(meta_sub$pesticides)
+meta_sub$head_trauma <- as.factor(meta_sub$head_trauma)
+meta_sub$alcohol <- as.factor(meta_sub$alcohol)
+meta_sub$levodopa <- as.factor(meta_sub$levodopa)
+meta_sub$plate <- as.factor(meta_sub$plate)
+meta_sub$SentrixPosition_A <- as.factor(meta_sub$SentrixPosition_A)
+meta_sub$agonist <- as.factor(meta_sub$agonist)
+rownames(meta_sub) <- meta_sub$Sample_Name
+
+meta_categorical <- meta_sub[,c("PD","reportedSex","smoking","pesticides","head_trauma","alcohol","levodopa","agonist","plate","SentrixPosition_A")]
+meta_continuous <- meta_sub[,c("GRS_scaled","Age","GPC1","GPC2","GPC3","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(colnames(mvals), rownames(meta_categorical)) #TRUE
+#check mvals and replace Inf
+min(mvals) #-Inf
+min(mvals[mvals>-Inf])
+#[1] -16.90111
+mvals[mvals==-Inf] <- min(mvals[mvals>-Inf])
+
+#PCA on M-values: input
+PCA_full<-princomp(mvals[complete.cases(mvals),])
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/pca_scree_digpd.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/pca_heat_legend_digpd.png)
+
+# Association analysis
+
+## EWAS model checks
+
+Prior to looking at results, I'll assess whether the new EWAS model seems appropriate using three measures:
+
+*1. Variance inflation factor*: The variance inflation factor (VIF) can be used to detect collinearity. Higher VIF values indicate a greater degree of collinearity. Typically VIF < 5 is considered acceptable.
+
+
+*2. Q-Q plot of nominal p-values*: If the variable of interest does not affect global DNAm, p-values should distribute close to the center line on a normal Q-Q plot, with some deviation at the tail indicating associations detected. The shape of the Q-Q plot can visually indicate model inflation or deflation.
+
+
+*3. Bias and inflation calculations*: The "bacon" package (van Iterson et al., 2017) was developed to calculate and optionally, correct for, bias and inflation observed in epigenome-wide association studies. It models test statistics using a Bayesian mixture model, and estimates the model parameters: bias (mean) and inflation (standard deviation). The Bayesian mixture model is proposed to more accurately model the quantitative nature and technical/biological influences on epigenomic and transcriptomic data, as opposed to the traditional genomic inflation factor (based on discrete genotypes).
+
+
+```{r ewas models, eval=F}
+## Variance inflation factor
+# check for one CpG (result is the same as when applied to all CpGs and averaged)
+vif(lm(mvals[1,] ~ meta_sub$GRS_scaled + meta_sub$Age + meta_sub$reportedSex + meta_sub$GPC1 + meta_sub$GPC2 + meta_sub$GPC3 + meta_sub$CTP_PC1 + meta_sub$CTP_PC2 + meta_sub$CTP_PC3 + meta_sub$CTP_PC4 + meta_sub$CTP_PC5 + meta_sub$plate + meta_sub$SentrixPosition_A + meta_sub$PD))[,3]
+#       meta_sub$GRS_scaled               meta_sub$Age       meta_sub$reportedSex              meta_sub$GPC1 
+#                  1.075278                   1.190657                   1.189692                   1.093675 
+#             meta_sub$GPC2              meta_sub$GPC3           meta_sub$CTP_PC1           meta_sub$CTP_PC2 
+#                  1.122025                   1.075263                   1.103085                   1.157309 
+#          meta_sub$CTP_PC3           meta_sub$CTP_PC4           meta_sub$CTP_PC5             meta_sub$plate 
+#                  1.101203                   1.051573                   1.071096                   1.060596 
+#meta_sub$SentrixPosition_A                meta_sub$PD 
+#                  1.088827                   1.465350 
+
+
+## Q-Q plot
+
+pvals <- sapply(1:nrow(mvals), function(x) {
+  coef(summary(lm(mvals[x,] ~ meta_sub$GRS_scaled+ meta_sub$Age + meta_sub$reportedSex + meta_sub$GPC1 + meta_sub$GPC2 + meta_sub$GPC3 + meta_sub$CTP_PC1 + meta_sub$CTP_PC2 + meta_sub$CTP_PC3 + meta_sub$CTP_PC4 + meta_sub$plate + meta_sub$SentrixPosition_A + meta_sub$PD)))[2,4]
+   })
+
+png("~/PD_GRS/EWAS_DIGPD/qqplot_DIGPD_unadj_1Mar26.png")
+qqunif.plot(pvals, title="Model adjusted for PD, batch, and cell type")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(pvals)
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 803734 test-statistics.
+#...estimated bias: 0.065.
+#...estimated inflation: 0.96.
+```
+![Q-Q plot for updated EWAS model](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/qqplot_DIGPD_unadj_1Mar26.png)
+
+
+## Differential methylation analysis
+
+Will used limma on all EPIC probes passing QC, modeling the data with M-values. I'll continue with this approach and transform results back to beta values later for plotting and interpretation purposes.
+
+First, as Will did, I'll apply the updated models to (1) the cross-sex sample, (2) males, (3) females, (4) PD cases, and (5) controls. This permits us to detect whether GRS associations with DNAm are dependent on sex and/or disease status.
+
+```{r prs ewas, eval=F}
+# set up meta data
+na_row <- !apply(meta_sub[, c("GRS_scaled", "Age", "reportedSex", "GPC1", "GPC2", "GPC3", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "plate", "SentrixPosition_A", "PD")], 1, function(x) any(is.na(x)))
+summary(na_row) #no NA's for these covariates
+str(meta_sub[,c("GRS_scaled", "Age", "reportedSex", "GPC1", "GPC2", "GPC3", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "plate", "SentrixPosition_A", "PD")]) #checking format again - good
+
+####### Cross-sex PRS EWAS
+# limma design matrix and linear model fit
+design_prs <- model.matrix(~ 1 + GRS_scaled + Age + reportedSex + GPC1 + GPC2 + GPC3 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + plate + SentrixPosition_A + PD, data = meta_sub)
+prs_fit <- lmFit(mvals, design_prs)
+prs_fit <- eBayes(prs_fit)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+prs_res <- limma::topTable(prs_fit, coef = 2, number = Inf, genelist=rownames(mvals))
+prs_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(prs_res[abs(prs_res$adjDB)>=0.03 & prs_res$adj.P.Val<=0.05,]) #0
+
+
+####### Cases only
+design_prs_case <- model.matrix(~ 1 + GRS_scaled + Age + reportedSex + GPC1 + GPC2 + GPC3 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + plate + SentrixPosition_A, data = meta_sub[meta_sub$PD=="1",])
+prs_fit_case <- lmFit(mvals[,match(unlist(meta_sub[meta_sub$PD=="1","Sample_Name"]), colnames(mvals))], design_prs_case)
+prs_fit_case <- eBayes(prs_fit_case)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_case$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+case_res <- limma::topTable(prs_fit_case, coef = 2, number = Inf, genelist=rownames(mvals))
+case_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(case_res[abs(case_res$adjDB)>=0.03 & case_res$adj.P.Val<=0.05,]) #0
+
+# Controls only
+design_prs_control <- model.matrix(~ 1 + GRS_scaled + Age + reportedSex + GPC1 + GPC2 + GPC3 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + plate + SentrixPosition_A, data = meta_sub[meta_sub$PD=="0",])
+prs_fit_control <- lmFit(mvals[,match(unlist(meta_sub[meta_sub$PD=="0","Sample_Name"]), colnames(mvals))], design_prs_control)
+prs_fit_control <- eBayes(prs_fit_control)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_control$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+control_res <- limma::topTable(prs_fit_control, coef = 2, number = Inf, genelist=rownames(mvals))
+control_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(control_res[abs(control_res$adjDB)>=0.03 & control_res$adj.P.Val<=0.05,]) #0
+
+# Males
+design_prs_male <- model.matrix(~ 1 + GRS_scaled + Age + GPC1 + GPC2 + GPC3 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + plate + SentrixPosition_A + PD, data = meta_sub[meta_sub$reportedSex=="M",])
+prs_fit_male <- lmFit(mvals[,match(unlist(meta_sub[meta_sub$reportedSex=="M","Sample_Name"]), colnames(mvals))], design_prs_male)
+# Coefficients not estimable: plate6 plate9 
+# Partial NA coefficients for 803777 probe(s)
+prs_fit_male <- eBayes(prs_fit_male)
+# Estimation of var.prior failed - set to default value
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_male$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+male_res <- limma::topTable(prs_fit_male, coef = 2, number = Inf, genelist=rownames(mvals))
+male_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(male_res[abs(male_res$adjDB)>=0.03 & male_res$adj.P.Val<=0.05,]) #0
+
+# Females
+design_prs_female <- model.matrix(~ 1 + GRS_scaled + Age + GPC1 + GPC2 + GPC3 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + plate + SentrixPosition_A + PD, data = meta_sub[meta_sub$reportedSex=="F",])
+prs_fit_female <- lmFit(mvals[,match(unlist(meta_sub[meta_sub$reportedSex=="F","Sample_Name"]), colnames(mvals))], design_prs_female)
+prs_fit_female <- eBayes(prs_fit_female)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+prs_fit_coef <- prs_fit_female$coefficients
+m0_eff <- prs_fit_coef[, "(Intercept)"] #M-value model intercept
+m1_eff <- m0_eff + prs_fit_coef[, "GRS_scaled"] #M-value model intercept plus GRS coefficient (delta M)
+
+female_res <- limma::topTable(prs_fit_female, coef = 2, number = Inf, genelist=rownames(mvals))
+female_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+nrow(female_res[abs(female_res$adjDB)>=0.03 & female_res$adj.P.Val<=0.05,]) #0
+
+# PD status EWAS check
+#design_pd <- model.matrix(~ 1 + PD + Age + reportedSex + GPC1 + GPC2 + GPC3 + CTP_PC1 + CTP_PC2 + CTP_PC3 + CTP_PC4 + plate + SentrixPosition_A, data = meta_sub)
+#pd_fit <- lmFit(mvals, design_pd)
+#pd_fit <- eBayes(pd_fit)
+# transform adjusted M-values to adjusted beta-values (code from Kruppa et al. 2021)
+#pd_fit_coef <- pd_fit$coefficients
+#m0_eff <- pd_fit_coef[, "(Intercept)"] #M-value model intercept
+#m1_eff <- m0_eff + pd_fit_coef[, "PD1"] #M-value model intercept plus GRS coefficient (delta M)
+
+#pd_res <- limma::topTable(pd_fit, coef = 2, number = Inf, genelist=rownames(mvals))
+#pd_res$adjDB <- m2beta(m1_eff) - m2beta(m0_eff) #transform each adjusted M-value to a beta-value, and subtract intercept beta value from intercept + coefficient beta value to obtain the adjusted delta beta
+#nrow(pd_res[abs(pd_res$adjDB)>=0.03 & pd_res$adj.P.Val<=0.05,]) #0
+
+
+# save everything
+# put limma results in separate csv's and together as one RData object for ease later
+#save(mvals, file="~/PD_GRS/DIGPD_Mvals.RData")
+write.csv(meta_sub, file="~/PD_GRS/meta_for_GRS_EWAS_DIGPD_22Feb26.csv", row.names=F)
+save(prs_res, control_res, case_res, male_res, female_res, file="~/PD_GRS/EWAS_DIGPD/DIGPD_EWAS_limma_all_1Mar26.RData")
+#write.csv(pd_res, file="~/PD_GRS/EWAS_DIGPD/DIGPD_EWAS_PD_22Feb26.csv", row.names=F)
+write.csv(prs_res, file="~/PD_GRS/EWAS_DIGPD/DIGPD_EWAS_GRS_cross_sex_1Mar26.csv", row.names=F)
+write.csv(case_res, file="~/PD_GRS/EWAS_DIGPD/DIGPD_EWAS_GRS_cases_1Mar26.csv", row.names=F)
+write.csv(control_res, file="~/PD_GRS/EWAS_DIGPD/DIGPD_EWAS_GRS_controls_1Mar26.csv", row.names=F)
+write.csv(male_res, file="~/PD_GRS/EWAS_DIGPD/DIGPD_EWAS_GRS_males_1Mar26.csv", row.names=F)
+write.csv(female_res, file="~/PD_GRS/EWAS_DIGPD/DIGPD_EWAS_GRS_females_1Mar26.csv", row.names=F)
+```
+
+### Plotting results
+
+For now, I am plotting adjusted delta M-values (model coefficients) to compare with the previous result, and will use the same thresholds reported by Will (delta M > 1.5, padj < 0.05). After, I'll calculate the delta betas for the same model.
+
+#### Cross-sex GRS EWAS
+```{r volcano cross sex, eval=F}
+# annotate topTable
+load("~/kobor_shared_coding_resource/EPIC_fdat.RData")
+fdat <- fData_EPIC[match(rownames(mvals), fData_EPIC$TargetID),]
+all(fdat$TargetID==rownames(mvals))
+colnames(prs_res)[1] <- "TargetID"
+prs_res <- left_join(prs_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(prs_res)[2:3] <- c("delta_M", "avgM")
+
+# plot with delta M threshold
+summary(prs_res$threshold_M <- (prs_res$adj.P.Val <= 0.05 & abs(prs_res$delta_M)>=1.5)) #0
+summary(prs_res$threshold_B <- (prs_res$adj.P.Val <= 0.05 & abs(prs_res$adjDB)>=0.03)) #0
+prs_res$DNAm_change <- "NS"
+
+max(abs(prs_res$delta_M)) #0.7115986
+max(-log10(prs_res$P.Value)) #5.030474
+
+png("~/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_cross_sex_Mvals_1Mar26.png", width=200, height=250)
+ggplot(prs_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + theme(legend.position="none")+ ylim(c(0,10)) + xlim(c(-2,2))
+dev.off()
+```
+![Updated EWAS model - DIGPD](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_cross_sex_Mvals_1Mar26.png)
+
+#### Cross-sex PD status EWAS
+```{r volcano pd, eval=F}
+# annotate topTable
+all(fdat$TargetID==rownames(mvals))
+colnames(pd_res)[1] <- "TargetID"
+pd_res <- left_join(pd_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(pd_res)[2:3] <- c("delta_M", "avgM")
+
+# plot with delta M threshold
+summary(pd_res$threshold_M <- (pd_res$adj.P.Val <= 0.05 & abs(pd_res$delta_M)>=1.5)) #none pass threshold
+min(pd_res$adj.P.Val) #0.03189665
+pd_res$DNAm_change <- "NS"
+
+max(abs(pd_res$delta_M)) #1.598307
+max(-log10(pd_res$P.Value)) #7.082169
+
+png("~/PD_GRS/EWAS_DIGPD/volcano_DIGPD_PD_Mvals_25Feb26.png", width=200, height=250)
+ggplot(pd_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9e-06)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + theme(legend.position="none")+ ylim(c(0,10)) + xlim(c(-2,2))
+dev.off()
+```
+![Cross-sex EWAS for PD status - DIGPD](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/volcano_DIGPD_PD_Mvals_25Feb26.png)
+
+There are no DNAm changes related to PD status in the DIGPD cross-sex sample (effect sizes are very small).
+
+
+#### Cross-sex GRS EWAS in PD cases
+```{r volcano cases, eval=F}
+# annotate topTable
+all(fdat$TargetID==rownames(mvals))
+colnames(case_res)[1] <- "TargetID"
+case_res <- left_join(case_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(case_res)[2:3] <- c("delta_M", "avgM")
+
+# plot with delta M threshold
+summary(case_res$threshold_M <- (case_res$adj.P.Val <= 0.05 & abs(case_res$delta_M)>=1.5)) #0
+case_res$DNAm_change <- "NS"
+
+max(abs(case_res$delta_M)) #0.7500686
+max(-log10(case_res$P.Value)) #6.036923
+
+png("~/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_cases_Mvals_1Mar26.png", width=200, height=250)
+ggplot(case_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5)  + theme(legend.position="none")+ ylim(c(0,10)) + xlim(c(-2,2))
+dev.off()
+```
+![EWAS in PD cases - DIGPD](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_cases_Mvals_1Mar26.png)
+
+#### Cross-sex GRS EWAS in controls
+```{r volcano control, eval=F}
+# annotate topTable
+all(fdat$TargetID==rownames(mvals))
+colnames(control_res)[1] <- "TargetID"
+control_res <- left_join(control_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(control_res)[2:3] <- c("delta_M", "avgM")
+
+# plot with delta M threshold
+summary(control_res$threshold_M <- (control_res$adj.P.Val <= 0.05 & abs(control_res$delta_M)>=1.5)) #no hits
+control_res$DNAm_change <- "NS"
+
+max(abs(control_res$delta_M)) #0.8419743
+max(-log10(control_res$P.Value)) #5.530825
+
+png("~/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_controls_Mvals_1Mar26.png", width=200, height=250)
+ggplot(control_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + theme(legend.position="none")+ ylim(c(0,10)) + xlim(c(-2,2))
+dev.off()
+```
+![EWAS in controls - DIGPD](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_controls_Mvals_1Mar26.png)
+
+#### Females GRS EWAS
+```{r volcano female, eval=F}
+# annotate topTable
+colnames(female_res)[1] <- "TargetID"
+female_res <- left_join(female_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(female_res)[2:3] <- c("delta_M", "avgM")
+# plot with delta M threshold
+summary(female_res$threshold_M <- (female_res$adj.P.Val <= 0.05 & abs(female_res$delta_M)>=1.5)) #no hits
+summary(female_res$threshold_M_0.1 <- (female_res$adj.P.Val <= 0.1 & abs(female_res$delta_M)>=1.5)) #no hits
+min(female_res$adj.P.Val) #0.06325405
+female_res$DNAm_change <- "NS"
+#write.csv(female_res, file="~/PD_GRS/DIGPD_EWAS_GRS_females.csv", row.names=F)
+
+max(abs(female_res$delta_M)) #1.221758
+max(-log10(female_res$P.Value)) #7.104024
+
+png("~/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_females_Mvals_1Mar26.png", width=200, height=250)
+ggplot(female_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + theme(legend.position="none")+ ylim(c(0,10)) + xlim(c(-2,2))
+dev.off()
+```
+![Updated female EWAS model - DIGPD](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_females_Mvals_1Mar26.png)
+
+#### Males GRS EWAS
+```{r volcano male, eval=F}
+# annotate topTable
+colnames(male_res)[1] <- "TargetID"
+male_res <- left_join(male_res, fdat, by="TargetID")
+
+# logFC: delta M
+# AveExpr: average M
+colnames(male_res)[2:3] <- c("delta_M", "avgM")
+male_res$DNAm_change <- "NS"
+
+# plot with delta M threshold
+summary(male_res$threshold_M <- (male_res$adj.P.Val <= 0.05 & abs(male_res$delta_M)>=1.5)) #no hits
+min(male_res$adj.P.Val) #0.9999897
+
+max(abs(male_res$delta_M)) #0.8340447
+max(-log10(male_res$P.Value)) #5.055405
+
+png("~/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_males_Mvals_1Mar26.png", width=200, height=250)
+ggplot(male_res[,c("delta_M","P.Value","DNAm_change")], aes(x=delta_M, y=-log10(P.Value), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta M") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("gray70")) + geom_hline(yintercept=-log10(9e-07)) + geom_vline(xintercept=-1.5) + geom_vline(xintercept=1.5) + theme(legend.position="none")+ ylim(c(0,10)) + xlim(c(-2,2))
+dev.off()
+```
+![Updated male EWAS model - DIGPD](/home1/NEURO/schaffner/PD_GRS/EWAS_DIGPD/volcano_DIGPD_GRS_males_Mvals_1Mar26.png)
+
+
+

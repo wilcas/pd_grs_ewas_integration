@@ -1,0 +1,435 @@
+---
+title: "TERRE GRS: Prediction of case-control status"
+output:
+  html_document:
+    df_print: paged
+---
+
+The manuscript "A Parkinson’s disease genetic risk score associates with blood DNAm on chromosome 17" explores how a genetic risk score (GRS) for Parkinson's disease (PD) associates with blood DNA methylation in the TERRE study of French agricultural workers, and evaluates GRS associations with DNAm in each sex as well as their sensitivity to non-genetic factors. This was originally spearheaded by Will Casazza and was posted as a pre-print on medRxiv in 2023. The current revision (2024, led by Sam Schaffner) aims to address previous reviewer feedback and prepare the manuscript for re-submission.
+
+
+This script evaluates how well the GRS can predict case-control status, in a cross-sex sample and sex-stratified samples. 
+
+
+Last updated Mar 8, 2026 by Samantha Schaffner: Including confidence intervals around GRS.
+
+Based on code by Will Casazza
+
+```{r setup, include=FALSE, eval=F}
+library(lumi)
+library(limma)
+library(minfi)
+library(rcompanion)
+library(readxl)
+library(tidyverse)
+library(ggpubr)
+library(glue)
+library(data.table)
+library(car)
+library(bacon)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(data.table)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+source("~/kobor_shared_coding_resource/qqplot_NG.R")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# PD risk score data and matching
+
+### Loading in and preparing data
+
+This code reads in the Nalls 2019 PD risk score loci and organizes it into a table with alleles and weights for each SNP. Here, I matched the meta data with the CMR project meta data that includes cell type PCs and batch information.
+```{r risk score dat, eval=FALSE}
+risk_scores <- read.delim("~/PD_GRS/WC_scripts/prs_analyses/gp2_2025_prs_file.txt", header=FALSE, sep=" ")
+head(risk_scores) #157 GP2 SNPs and their weights
+#          V1 V2      V3
+#1   rs377808  G -0.0486
+#2 rs12128848  G -0.0414
+#3 rs76763715  C  0.8378
+#4 rs75548401  A  0.3649
+#5  rs2230288  T  0.4595
+#6 rs72712862  T  0.2103
+
+terre_prs <- fread("~/PD_GRS/WC_scripts/prs_analyses/terre_prs_gp2_2025.sscore")
+# GRS computed in TERRE based on 121/157 SNPs present after QC filtering
+
+terre_pcs <- fread("~/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.eigenvec")
+#Columns V1 and V2 are ID labels, V3-V22 are PCs
+terre_metadata <- read.csv("/home1/NEURO/SHARE_DECIPHER/terre_meta_master.csv") %>%
+  mutate(
+    FID = gsub("(PAE_[0-9]*_[1-9]*)_.*", "\\1", FID),
+    IID = gsub("(PAE_[0-9]*_[1-9]*)_.*", "\\1", IID)
+  )
+
+all_data <- terre_prs %>%
+  left_join(terre_metadata, by = c("IID")) %>%
+  left_join(terre_pcs, by = c("IID" = "V1"))
+
+# get genotype and DNAm PCs from the following file:
+prsice_cov <- fread("~/SHARE_DECIPHER/pd_grs_ewas_integration/prs_analyses/prsice_cov_and_status_mvalues.txt")
+all(prsice_cov$patient %in% all_data$patient) #TRUE
+colnames(all_data) <- gsub("men", "sex", colnames(all_data))
+meta <- left_join(prsice_cov, all_data, by=c("patient","PD","IID","sex","age","V3","V4","V5"))
+colnames(meta) #rename DNAm and geno PC columns for clarity
+colnames(meta)[1:10] <- paste("DNAm", colnames(meta)[1:10], sep="_")
+colnames(meta)[13:15] <- paste("geno", colnames(meta)[13:15], sep="_")
+meta <- meta[,-23] #remove extra dummy column "X"
+colnames(meta)
+
+# add batch and cell type variables
+propensity_meta_F <- read.csv("~/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/3-terre_meta_F_probit_matched_4.5.3.csv")
+propensity_meta_M <- read.csv("~/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/3-terre_meta_M_probit_matched_4.5.3.csv")
+# fix sex columns
+propensity_meta_F$reportedSex <- "F"
+propensity_meta_M$reportedSex <- "M"
+propensity_meta <- rbind(propensity_meta_F, propensity_meta_M)
+
+# re-code and join
+colnames(propensity_meta)[7] <- "sex"
+meta$sex <- gsub(0, "F", gsub(1, "M", meta$sex))
+all(propensity_meta$patient %in% meta$patient) #TRUE
+cols <- colnames(meta)[colnames(meta) %in% colnames(propensity_meta)]
+meta <- left_join(meta, propensity_meta, by=cols)
+colnames(meta)
+#write.csv(meta, file="~/PD_GRS/meta_geno_DNAm_PCs_15Nov2025.csv", row.names=F) 
+
+# DNAm data
+load("~/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/1-TERRE_RG_filtered.RData")
+mvals <- getM(PD_RG_filtered)
+```
+
+# Testing how well GRS explains case-control status
+
+Prior to EWAS, testing GRS performance here in TERRE (cross-sex and sex-stratified). Models updated here May 17, 2025 to remove additional DNAm-related covariates not neccessary for inclusion in the models.
+
+GRS performance is assessed here by comparing models predicting case-control status that include or do not include the GRS. The nagelkerke() function from the "rcompanion" package produces pseudo R-squared measurements, which indicate how well each model explains the data relative to each other. A higher R squared indicates better prediction of the outcome. The Nagelkerke measure is an more interpretable adjustment of the Cox and Snell measure, where the upper bound is 1.
+
+Liability scale heritability for the PD GRS is also calculated, which assumes there is a continuous distribution of risk for PD that is influenced by genetic and environmental factors. Heritability is interpreted here as the proportion of variance in PD risk that is due to genetics.
+
+### Scale GRS
+The GRS should have a mean of 0 and SD of 1 after scaling.
+```{r scale, eval=F}
+# check scaling of PGS: should have mean of 0, SD of 1
+mean(meta$SCORE1_AVG) #-0.0001592716
+sd(meta$SCORE1_AVG) #0.001668885
+plot(density(meta$SCORE1_AVG))
+
+meta$GRS_scaled <- scale(meta$SCORE1_AVG)
+mean(meta$GRS_scaled) #-6.223874e-18
+sd(meta$GRS_scaled) #1
+
+#mean and SD by PD status
+meta_PD <- meta[meta$PD==1,]
+mean(meta_PD$GRS_scaled) #0.2353693
+sd(meta_PD$GRS_scaled) #0.9141755
+
+meta_ctrl <- meta[meta$PD==0,]
+mean(meta_ctrl$GRS_scaled) #-0.1129136
+sd(meta_ctrl$GRS_scaled) #1.022467
+
+par(mfrow=c(2,1))
+plot(density(meta$SCORE1_AVG), main="GRS prior to scaling", xlim=c(-3,3))
+plot(density(meta$GRS_scaled), main="GRS after scaling", xlim=c(-3,3))
+
+write.csv(meta, file="~/PD_GRS/meta_geno_DNAm_PCs_1Feb2026.csv", row.names=F) 
+```
+![GRS distribution before and after scaling](/home1/NEURO/schaffner/PD_GRS/grs_scaled_1Feb2026.png)
+
+![GRS distribution before and after scaling, on the same x-axis](/home1/NEURO/schaffner/PD_GRS/grs_scaled_xlim_1Feb2026.png)
+
+## Model with genotype PCs only
+```{r model genoPCs, eval=F}
+fit1 <- glm(PD ~ GRS_scaled + sex + age + geno_V3 + geno_V4 + geno_V5, data = meta, family = "binomial")
+summary(fit1) #GRS: p = 0.00998
+fit1_null <- glm(PD ~ sex + age + geno_V3 + geno_V4 + geno_V5, data = meta, family = "binomial")
+summary(fit1_null) #nothing sig
+(cross_r2 <- nagelkerke(fit1, null = fit1_null))
+#                             Pseudo.R.squared
+#McFadden                            0.0252884
+#Cox and Snell (ML)                  0.0310331
+#Nagelkerke (Cragg and Uhler)        0.0435538
+
+#bootstrapping to generate 95% CI for R squared
+library(boot)
+library(rcompanion)
+
+get_nagelkerke <- function(data, indices) {
+  boot_data <- data[indices, ]
+  fit1 <- glm(PD ~ GRS_scaled + sex + age + geno_V3 + geno_V4 + geno_V5, boot_data, family = "binomial")
+  fit1_null <- glm(PD ~ sex + age + geno_V3 + geno_V4 + geno_V5, boot_data, family = "binomial")
+  r2_out <- suppressWarnings(nagelkerke(fit1, null=fit1_null))
+  nagelkerke_val <- as.numeric(r2_out$Pseudo.R.squared.for.model.vs.null[3])
+  return(nagelkerke_val)
+}
+
+set.seed(123)
+boot_results <- boot(data = meta, statistic = get_nagelkerke, R = 1000, strata = as.factor(meta$PD))
+boot.ci(boot_results, type = "bca")
+#Level       BCa          
+#95%   ( 0.0039,  0.1168 )  
+
+#liability scale heritability calculation, mirroring Lee et al. approach
+lee_h2 <- function(R2O, case_prop, prevalence) {
+  K <- prevalence
+  P <- case_prop
+  thd <- qnorm(1 - K) # Threshold
+  z <- dnorm(thd) # Height of the normal density at the threshold
+  h2_liab <- R2O * (K * (1 - K) / z^2) * (K * (1 - K) / (P * (1 - P)))
+  return(h2_liab)
+}
+
+R2 <- cross_r2$Pseudo.R.squared.for.model.vs.null[3]
+summary(as.factor(meta$PD))
+#  0   1 
+#148  71 
+h2 <- lee_h2(R2, 71/219, 5/1000)
+R2 #0.0435538
+h2 #0.02353202
+```
+
+## Sex-stratified models
+```{r sex strat r2, eval=F}
+fit1_male <- glm(PD ~ GRS_scaled + age + geno_V3 + geno_V4 + geno_V5, data = meta[meta$sex == "M", ], family = "binomial")
+summary(fit1_male) #GRS scaled: p = 0.0382
+fit1_male_null <- glm(PD ~ age + geno_V3 + geno_V4 + geno_V5, data = meta[meta$sex == "M", ], family = "binomial")
+summary(fit1_male_null) #nothing significant
+(male_r2 <- nagelkerke(fit1_male, null = fit1_male_null))
+#                            Pseudo.R.squared
+#McFadden                            0.0309933
+#Cox and Snell (ML)                  0.0375458
+#Nagelkerke (Cragg and Uhler)        0.0529492
+
+get_nagelkerke_strat <- function(data, indices) {
+  boot_data <- data[indices, ]
+  fit1 <- glm(PD ~ GRS_scaled + age + geno_V3 + geno_V4 + geno_V5, boot_data, family = "binomial")
+  fit1_null <- glm(PD ~ age + geno_V3 + geno_V4 + geno_V5, boot_data, family = "binomial")
+  r2_out <- suppressWarnings(nagelkerke(fit1, null=fit1_null))
+  nagelkerke_val <- as.numeric(r2_out$Pseudo.R.squared.for.model.vs.null[3])
+  return(nagelkerke_val)
+}
+
+boot_results <- boot(data = meta[meta$sex == "M", ], statistic = get_nagelkerke_strat, R = 1000, strata = as.factor(meta[meta$sex == "M", "PD"]))
+boot.ci(boot_results, type = "bca")
+#Level       BCa          
+#95%   ( 0.0011,  0.1803 )  
+
+# liability R2 for updated male model
+R2 <- male_r2$Pseudo.R.squared.for.model.vs.null[3]
+summary(as.factor(meta[meta$sex%in%"M","PD"]))
+# 0  1 
+#81 38
+h2 <- lee_h2(R2, 38/119, 5/1000)
+R2 #0.0529492
+h2 #0.02883698
+
+fit1_female <- glm(PD ~ GRS_scaled + age + geno_V3 + geno_V4 + geno_V5, data = meta[meta$sex == "F", ], family = "binomial")
+summary(fit1_female) #GRS p = 0.108
+fit1_female_null <- glm(PD ~ age + geno_V3 + geno_V4 + geno_V5, data = meta[meta$sex == "F", ], family = "binomial")
+summary(fit1_female_null) #nothing sig
+(female_r2 <- nagelkerke(fit1_female, null = fit1_female_null))
+#                             Pseudo.R.squared
+#McFadden                            0.0212641
+#Cox and Snell (ML)                  0.0262270
+#Nagelkerke (Cragg and Uhler)        0.0367606
+
+boot_results <- boot(data = meta[meta$sex == "F", ], statistic = get_nagelkerke_strat, R = 1000, strata = as.factor(meta[meta$sex == "F", "PD"]))
+boot.ci(boot_results, type = "bca")
+#Level       BCa          
+#95%   ( 0.0001,  0.1449 )  
+
+# liability R2 for updated female model
+R2 <- female_r2$Pseudo.R.squared.for.model.vs.null[3]
+summary(as.factor(meta[meta$sex=="F","PD"]))
+# 0  1 
+#67 33 
+h2 <- lee_h2(R2, 33/100, 5/1000)
+R2 #0.0367606
+h2 #0.01968153
+```
+
+### Plotting cross-sex and sex-stratified GRS models
+```{r plot GRS, eval=F}
+r2_labels <- c(0.0436,0.0529,0.0368)
+names(r2_labels) <- c("Cross-sex","Male","Female")
+
+pval_labels <- c(
+  round(cross_r2$Likelihood.ratio.test[4], 4),
+  round(male_r2$Likelihood.ratio.test[4], 4),
+  round(female_r2$Likelihood.ratio.test[4], 4)
+)
+names(pval_labels) <- c("Cross-sex", "Male", "Female")
+
+to_plot <- meta %>%
+  mutate(
+    PD = ifelse(PD, "CASE", "CONTROL"),
+    Sex = ifelse(sex == "M", "Male", "Female")
+  ) %>%  mutate(Sex = factor(Sex, levels = c("Cross-sex", "Male", "Female")))
+cross_data <- meta %>% mutate(PD = ifelse(PD, "CASE", "CONTROL"))
+cross_data$Sex <- "Cross-sex"
+to_plot <- rbind(cross_data, to_plot)
+library(DescTools)
+to_plot$Sex <- reorder.factor(to_plot$Sex, new.order=c("Cross-sex","Male","Female"))
+
+png("~/PD_GRS/prs_plots_by_PD_sex_8Mar2026.png", width=600, height=500)
+ggboxplot(
+  to_plot,
+  x = "PD",
+  y = "GRS_scaled",
+  color = "Sex",
+  add = "jitter"
+) +
+  facet_grid(~Sex, labeller = label_bquote(cols = .(as.character(Sex)) ~ R^2 ~ ": " ~ .(r2_labels[Sex]) ~ ";" ~ p-value ~ ": " ~ .(pval_labels[Sex]))) +
+  labs(y = "Genetic Risk Score (Scaled)", x = "Parkinson's Diagnosis") +
+  scale_color_manual(values = c("gray", "lightblue", "pink")) + stat_compare_means(method="t.test", label.x.npc="center",hjust=0.5)
+dev.off()
+
+png("~/PD_GRS/prs_plots_by_sex_1Feb2026.png", width=300, height=500)
+ggboxplot(
+  to_plot,
+  x = "Sex",
+  y = "GRS_scaled",
+  color = "Sex",
+  add = "jitter"
+) +
+  stat_compare_means() +
+
+  labs(y = "Genetic Risk Score (Scaled)") +
+  scale_color_manual(values = c("Male" = "light blue", "Female" = "pink"))
+dev.off()
+```
+![GRS by PD status and sex](/home1/NEURO/schaffner/PD_GRS/prs_plots_by_PD_sex_8Mar2026.png)
+
+![PRS by sex (cases and controls combined)](/home1/NEURO/schaffner/PD_GRS/prs_plots_by_sex_1Feb2026.png)
+
+## Model with environmental covariates
+
+Does this improve the ability of the GRS to explain variation in PD status? Compare the R2 for models with and without environmental covariates.
+```{r model genoPCs env, eval=F}
+fit1 <- glm(PD ~ GRS_scaled + sex + age + geno_V3 + geno_V4 + geno_V5 + smoking + head_trauma + alcohol1, data = meta, family = "binomial")
+summary(fit1) #GRS: p = 0.00977, smoking p = 0.02961
+fit1_null <- glm(PD ~ sex + age + geno_V3 + geno_V4 + geno_V5 + smoking + head_trauma + alcohol1, data = meta, family = "binomial")
+summary(fit1_null) #smoking p = 0.0277
+(cross_r2 <- nagelkerke(fit1, null = fit1_null))
+#                             Pseudo.R.squared
+#McFadden                            0.0261105
+#Cox and Snell (ML)                  0.0313601
+#Nagelkerke (Cragg and Uhler)        0.0444915
+
+R2 <- cross_r2$Pseudo.R.squared.for.model.vs.null[3]
+
+h2 <- lee_h2(R2, 71/219, 5/1000)
+R2 #0.0444915
+h2 #0.02403866
+```
+
+## Sex-stratified models with environmental covariates
+```{r sex strat r2 env, eval=F}
+fit1_male <- glm(PD ~ GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + smoking + head_trauma + alcohol1, data = meta[meta$sex == "M", ], family = "binomial")
+summary(fit1_male) #GRS scaled: p = 0.0754; smoking: p = 0.0429
+fit1_male_null <- glm(PD ~ age + geno_V3 + geno_V4 + geno_V5 + smoking + head_trauma + alcohol1, data = meta[meta$sex == "M", ], family = "binomial")
+summary(fit1_male_null) #smoking: p = 0.0389
+(male_r2 <- nagelkerke(fit1_male, null = fit1_male_null))
+#                             Pseudo.R.squared
+#McFadden                            0.0241200
+#Cox and Snell (ML)                  0.0275671
+#Nagelkerke (Cragg and Uhler)        0.0401742
+
+# liability R2 for updated male model
+R2 <- male_r2$Pseudo.R.squared.for.model.vs.null[3]
+summary(as.factor(meta[meta$sex%in%"M","PD"]))
+# 0  1 
+#81 38
+h2 <- lee_h2(R2, 38/119, 5/1000)
+R2 #0.0401742
+h2 #0.02187951
+
+fit1_female <- glm(PD ~ GRS_scaled + age + geno_V3 + geno_V4 + geno_V5 + smoking + head_trauma + alcohol1, data = meta[meta$sex == "F", ], family = "binomial")
+summary(fit1_female) #GRS p = 0.123
+fit1_female_null <- glm(PD ~ age + geno_V3 + geno_V4 + geno_V5 + smoking + head_trauma + alcohol1, data = meta[meta$sex == "F", ], family = "binomial")
+summary(fit1_female_null) #nothing sig
+(female_r2 <- nagelkerke(fit1_female, null = fit1_female_null))
+#                             Pseudo.R.squared
+#McFadden                            0.0199089
+#Cox and Snell (ML)                  0.0241738
+#Nagelkerke (Cragg and Uhler)        0.0341701
+
+# liability R2 for updated female model
+R2 <- female_r2$Pseudo.R.squared.for.model.vs.null[3]
+summary(as.factor(meta[meta$sex=="F","PD"]))
+# 0  1 
+#67 33 
+h2 <- lee_h2(R2, 33/100, 5/1000)
+R2 #0.0341701
+h2 #0.01829458
+```
+
+### Plotting cross-sex and sex-stratified GRS models with env covariates
+```{r plot GRS env, eval=F}
+r2_labels <- c(0.0445,0.0402,0.0342)
+names(r2_labels) <- c("Cross-sex","Male","Female")
+
+pval_labels <- c(
+  round(cross_r2$Likelihood.ratio.test[4], 4),
+  round(male_r2$Likelihood.ratio.test[4], 4),
+  round(female_r2$Likelihood.ratio.test[4], 4)
+)
+names(pval_labels) <- c("Cross-sex", "Male", "Female")
+
+to_plot <- meta %>%
+  mutate(
+    PD = ifelse(PD, "CASE", "CONTROL"),
+    Sex = ifelse(sex == "M", "Male", "Female")
+  ) %>%  mutate(Sex = factor(Sex, levels = c("Cross-sex", "Male", "Female")))
+cross_data <- meta %>% mutate(PD = ifelse(PD, "CASE", "CONTROL"))
+cross_data$Sex <- "Cross-sex"
+to_plot <- rbind(cross_data, to_plot)
+library(DescTools)
+to_plot$Sex <- reorder.factor(to_plot$Sex, new.order=c("Cross-sex","Male","Female"))
+
+png("~/PD_GRS/prs_plots_by_PD_sex_env_1Feb2026.png", width=600, height=500)
+ggboxplot(
+  to_plot,
+  x = "PD",
+  y = "GRS_scaled",
+  color = "Sex",
+  add = "jitter"
+) +
+  facet_grid(~Sex, labeller = label_bquote(cols = .(as.character(Sex)) ~ R^2 ~ ": " ~ .(r2_labels[Sex]) ~ ";" ~ p-value ~ ": " ~ .(pval_labels[Sex]))) +
+  labs(y = "Genetic Risk Score (Scaled)", x = "Parkinson's Diagnosis") +
+  scale_color_manual(values = c("gray", "lightblue", "pink"))
+dev.off()
+
+png("~/PD_GRS/prs_plots_by_sex_env_1Feb2026.png", width=300, height=500)
+ggboxplot(
+  to_plot,
+  x = "Sex",
+  y = "GRS_scaled",
+  color = "Sex",
+  add = "jitter"
+) +
+  stat_compare_means() +
+
+  labs(y = "Genetic Risk Score (Scaled)") +
+  scale_color_manual(values = c("Male" = "light blue", "Female" = "pink"))
+dev.off()
+```
+![GRS by PD status and sex, adjusted for environment](/home1/NEURO/schaffner/PD_GRS/prs_plots_by_PD_sex_env_1Feb2026.png)
+
+![PRS by sex (cases and controls combined), adjusted for environment](/home1/NEURO/schaffner/PD_GRS/prs_plots_by_sex_env_1Feb2026.png)
+
+## Additional sensitivity tests 
+Interactions with PRS x sex, PRS x smoking, and PRS x pesticides will be explored here to see if they better explain PD status.
+```{r GRS sensitivity, eval=F}
+fit2 <- glm(PD ~ GRS_scaled * sex + age + geno_V3 + geno_V4 + geno_V5, data = meta, family = "binomial")
+summary(fit2) #PRS p = 0.122, interaction p = 0.633
+fit3 <- glm(PD ~ GRS_scaled * smoking + sex + age + geno_V3 + geno_V4 + geno_V5, data = meta, family = "binomial")
+summary(fit3) # PRS p = 0.9897, smoking p = 0.0240, interaction p = 0.3298
+fit4 <- glm(PD ~ GRS_scaled * pesticides + sex + age + geno_V3 + geno_V4 + geno_V5, data = meta, family = "binomial")
+summary(fit4) #PRS p = 0.4162, pest p =  0.5629, geno V4 p = 0.0608, interaction p = 0.3052 
+
+fit_null <- glm(PD ~ GRS_scaled, data = meta, family = "binomial")
+summary(fit_null) #p = 0.017
+```
+

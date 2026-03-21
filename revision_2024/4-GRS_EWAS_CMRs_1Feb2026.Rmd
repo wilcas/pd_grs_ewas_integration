@@ -1,0 +1,482 @@
+---
+title: "TERRE GRS: Epigenome-wide asssociation analysis"
+output: html_notebook
+---
+
+The manuscript "A Parkinson’s disease genetic risk score associates with blood DNAm on chromosome 17" explores how a genetic risk score (GRS) for Parkinson's disease (PD) associates with blood DNA methylation in the TERRE study of French agricultural workers, and evaluates GRS associations with DNAm in each sex as well as their sensitivity to non-genetic factors. This was originally spearheaded by Will Casazza and was posted as a pre-print on medRxiv in 2023. The current revision (2024, led by Sam Schaffner) aims to address previous reviewer feedback and prepare the manuscript for re-submission.
+
+Last updated Mar 20, 2026 by Samantha Schaffner: Controlling for pesticide exposure.
+
+```{r setup, include=FALSE, eval=F}
+library(minfi)
+library(dplyr)
+library(ggplot2)
+library(DescTools)
+library(reshape2)
+library(MASS)
+library(sfsmisc)
+library(gridExtra)
+library(ggrepel)
+source("~/kobor_shared_coding_resource/qqplot_NG.R")
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+source("~/kobor_shared_coding_resource/correlation_pval.R")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Meta data correlation heat map
+
+### Females
+```{r meta heat F, eval=F}
+meta <- read.csv("~/PD_GRS/meta_geno_DNAm_PCs_1Feb2026.csv")
+meta_F <- meta[meta$sex%in%"F",]
+meta_F <- meta_F[,c("patient","GRS_scaled","PD","age","geno_V3","geno_V4","geno_V5","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","CTP_PC6","smoking","pesticides","head_trauma","alcohol1","levodopa","agonist","plate","SentrixPosition_A")]
+
+#Create correlation matrix
+terre_meta_cor <- meta_F[,-1] #remove "patient" and non-scaled GRS
+cormat <- correlation_pval(terre_meta_cor)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+upper_tri <- get_upper_tri(cormat)
+
+#colour if sig
+for(x in 1:nrow(upper_tri)){
+  for(y in 1:ncol(upper_tri)){
+    if(is.na(upper_tri[x,y])==FALSE){
+    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+  }}
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+png("~/PD_GRS/EWAS_TERRE/terre_meta_cor_F_1Feb26.png", width=600, height=600)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+```
+![Females: Meta data correlation heat map](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/terre_meta_cor_F_1Feb26.png)
+
+Age is correlated strongly with plate and row.
+
+The GRS correlates moderately with genotype and cell type PCs.
+
+### Males
+```{r meta heat M, eval=F}
+meta_M <- meta[meta$sex%in%"M",]
+meta_M <- meta_M[,c("patient","GRS_scaled","PD","age","geno_V3","geno_V4","geno_V5","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","CTP_PC6","smoking","pesticides","head_trauma","alcohol1","levodopa","agonist","plate","SentrixPosition_A")]
+
+#Create correlation matrix
+terre_meta_cor <- meta_M[,-1] #remove "patient" and non-scaled GRS
+cormat <- correlation_pval(terre_meta_cor)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+upper_tri <- get_upper_tri(cormat)
+
+#colour if sig
+for(x in 1:nrow(upper_tri)){
+  for(y in 1:ncol(upper_tri)){
+    if(is.na(upper_tri[x,y])==FALSE){
+    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+  }}
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+png("~/PD_GRS/EWAS_TERRE/terre_meta_cor_M_1Feb26.png", width=600, height=600)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+```
+![Males: Meta data correlation heat map](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/terre_meta_cor_M_1Feb26.png)
+
+## PCA correlation with meta data
+
+### Females
+```{r DNAm meta pca F, eval=F}
+load("~/PD_CMRs_GxE/2-EWAS_CMRs/TERRE/refCMR_medB_F_var.RData")
+
+#restructing meta data and subsetting to categorical/continuous
+nrow(terre_F <- meta_F[meta_F$patient %in% rownames(refCMR_medB_F_var),]) #100
+terre_F <- terre_F[match(rownames(refCMR_medB_F_var), terre_F$patient),]
+str(terre_F)
+terre_F$PD <- as.factor(terre_F$PD)
+terre_F$smoking <- as.factor(terre_F$smoking)
+terre_F$pesticides <- as.factor(terre_F$pesticides)
+terre_F$head_trauma <- as.factor(terre_F$head_trauma)
+terre_F$alcohol1 <- as.factor(terre_F$alcohol1)
+terre_F$levodopa <- as.factor(terre_F$levodopa)
+terre_F$agonist <- as.factor(terre_F$age)
+terre_F$plate <- as.factor(terre_F$plate)
+terre_F$SentrixPosition_A <- as.factor(terre_F$SentrixPosition_A)
+rownames(terre_F) <- terre_F$patient
+
+meta_categorical <- terre_F[,c("PD","smoking","pesticides","head_trauma","alcohol1","levodopa","agonist","plate","SentrixPosition_A")]
+meta_continuous <- terre_F[,c("GRS_scaled","age","geno_V3","geno_V4","geno_V5","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(rownames(refCMR_medB_F_var), rownames(meta_categorical)) #TRUE
+
+#PCA on M-values: input
+PCA_full<-princomp(t(refCMR_medB_F_var))
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_CMRs_F_scree_1Feb26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_CMRs_F_heat_1Feb26.png)
+
+The GRS, disease status, environmental factors, and age all do not load onto the first 10 PCs of the variable reference CMRs.
+
+### Males
+```{r DNAm meta pca M, eval=F}
+load("~/PD_CMRs_GxE/2-EWAS_CMRs/TERRE/refCMR_medB_M_var.RData")
+
+#restructing meta data and subsetting to categorical/continuous
+nrow(terre_M <- meta_M[meta_M$patient %in% rownames(refCMR_medB_M_var),]) #118
+terre_M <- terre_M[match(rownames(refCMR_medB_M_var), terre_M$patient),]
+str(terre_M)
+terre_M$PD <- as.factor(terre_M$PD)
+terre_M$smoking <- as.factor(terre_M$smoking)
+terre_M$pesticides <- as.factor(terre_M$pesticides)
+terre_M$head_trauma <- as.factor(terre_M$head_trauma)
+terre_M$alcohol1 <- as.factor(terre_M$alcohol1)
+terre_M$levodopa <- as.factor(terre_M$levodopa)
+terre_M$agonist <- as.factor(terre_M$age)
+terre_M$plate <- as.factor(terre_M$plate)
+terre_M$SentrixPosition_A <- as.factor(terre_M$SentrixPosition_A)
+rownames(terre_M) <- terre_M$patient
+
+meta_categorical <- terre_M[,c("PD","smoking","pesticides","head_trauma","alcohol1","levodopa","agonist","plate","SentrixPosition_A")]
+meta_continuous <- terre_M[,c("GRS_scaled","age","geno_V3","geno_V4","geno_V5","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(rownames(refCMR_medB_M_var), rownames(meta_categorical)) #TRUE
+
+#PCA on M-values: input
+PCA_Full<-princomp(t(refCMR_medB_M_var))
+
+PCA_Plot(PCA_Full, type="sparse", MTC=T, Discrete=T)
+```
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_CMRs_M_scree_1Feb26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/pca_CMRs_M_heat_1Feb26.png)
+
+In males, PD status correlates weakly with the 3rd PC of variable reference CMR DNAm.
+
+
+# Association analysis
+
+## EWAS model checks
+
+Prior to looking at results, I'll assess whether the new EWAS model seems appropriate using three measures:
+
+*1. Variance inflation factor*: The variance inflation factor (VIF) can be used to detect collinearity. Higher VIF values indicate a greater degree of collinearity. Typically VIF < 5 is considered acceptable.
+
+
+*2. Q-Q plot of nominal p-values*: If the variable of interest does not affect global DNAm, p-values should distribute close to the center line on a normal Q-Q plot, with some deviation at the tail indicating associations detected. The shape of the Q-Q plot can visually indicate model inflation or deflation.
+
+
+*3. Bias and inflation calculations*: The "bacon" package (van Iterson et al., 2017) was developed to calculate and optionally, correct for, bias and inflation observed in epigenome-wide association studies. It models test statistics using a Bayesian mixture model, and estimates the model parameters: bias (mean) and inflation (standard deviation). The Bayesian mixture model is proposed to more accurately model the quantitative nature and technical/biological influences on epigenomic and transcriptomic data, as opposed to the traditional genomic inflation factor (based on discrete genotypes).
+
+
+## Females
+
+### With adjustment for environmental covariates
+```{r terre models F unadj, eval=F}
+all(terre_F$patient==rownames(refCMR_medB_F_var)) #TRUE
+
+# VIF
+sapply(vif(lm(refCMR_medB_F_var[,1] ~ terre_F$GRS_scaled + terre_F$PD + terre_F$age + terre_F$CTP_PC1 + terre_F$CTP_PC2 + terre_F$CTP_PC3 + terre_F$CTP_PC4 + terre_F$CTP_PC5 + terre_F$CTP_PC6 + terre_F$geno_V3 + terre_F$geno_V4 + terre_F$geno_V5 + terre_F$SentrixPosition_A))[,3], function(x) x^2)
+#       terre_F$GRS_scaled                terre_F$PD               terre_F$age           terre_F$CTP_PC1 
+#                 1.236171                  1.177893                  1.204187                  1.282044 
+#          terre_F$CTP_PC2           terre_F$CTP_PC3           terre_F$CTP_PC4           terre_F$CTP_PC5 
+#                 1.582574                  2.146836                  1.627604                  1.453321 
+#          terre_F$CTP_PC6           terre_F$geno_V3           terre_F$geno_V4           terre_F$geno_V5 
+#                 1.604226                  1.315492                  1.395277                  1.195177 
+#terre_F$SentrixPosition_A 
+#                 1.140656 
+
+rlm_pvals_F <- lapply(1:ncol(refCMR_medB_F_var), function(x) {
+ RLM <- rlm(refCMR_medB_F_var[,x] ~ terre_F$GRS_scaled + terre_F$PD + terre_F$age + terre_F$plate + terre_F$SentrixPosition_A + terre_F$CTP_PC1 + terre_F$CTP_PC2 + terre_F$CTP_PC3 + terre_F$CTP_PC4 + terre_F$CTP_PC5 + terre_F$CTP_PC6 + terre_F$geno_V3 + terre_F$geno_V4 + terre_F$geno_V5, psi = psi.huber, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+png("~/PD_GRS/EWAS_TERRE/qqplot_CMRs_F_unadj_1Feb26.png")
+qqunif.plot(unlist(rlm_pvals_F), title="EWAS on reference CMRs: Females")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(unlist(rlm_pvals_F))
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 29363 test-statistics.
+#...estimated bias: -0.26.
+#...estimated inflation: 1.1.
+
+results.F <- as.data.frame(do.call(rbind, rlm_pvals_F))
+rownames(results.F) <- colnames(refCMR_medB_F_var)
+names(results.F)[1] <- "pval"
+results.F$adjP_BH <- p.adjust(results.F$pval, method="BH")
+results.F$TargetID <- rownames(results.F)
+
+coefs_F <- lapply(1:ncol(refCMR_medB_F_var), function(x) {
+ rlm(refCMR_medB_F_var[,x] ~ terre_F$GRS_scaled + terre_F$PD + terre_F$age + terre_F$plate + terre_F$SentrixPosition_A + terre_F$CTP_PC1 + terre_F$CTP_PC2 + terre_F$CTP_PC3 + terre_F$CTP_PC4 + terre_F$CTP_PC5 + terre_F$CTP_PC6 + terre_F$geno_V3 + terre_F$geno_V4 + terre_F$geno_V5, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(names(coefs_F)==rownames(results.F)) #TRUE
+results.F$adjDB <- unlist(coefs_F)
+
+#how many sites pass DB 0.03 and FDR 0.05 with BH multiple test correction?
+summary(results.F$threshold_adjDB <- (results.F$adjP_BH <= 0.05 & abs(results.F$adjDB) >= 0.03)) #0
+write.csv(results.F, file="~/PD_GRS/EWAS_TERRE/EWAS_CMRs_F_unadj_1Feb26.csv", row.names=F)
+
+#Volcano plot
+max(abs(results.F$adjDB)) #0.1207723
+max(-log10(results.F$pval)) #5.481163
+
+png("~/PD_GRS/EWAS_TERRE/volcano_CMRs_F_unadj_1Feb26.png", width=200, height=250)
+ggplot(results.F[,c("adjDB","pval")], aes(x=adjDB, y=-log10(pval), colour="gray70")) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") + scale_colour_manual(values="gray70")+
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + xlim(c(-0.1,0.1)) + ylim(c(0,6)) + theme(legend.position="none")
+dev.off()
+```
+![Female EWAS model, without environmental covariates](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_CMRs_F_unadj_1Feb26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_CMRs_F_unadj_1Feb26.png)
+
+### With adjustment for environmental covariates
+```{r terre models F adj, eval=F}
+nrow(terre_F_pest <- terre_F[complete.cases(terre_F$pesticides),]) #96
+summary(as.factor(terre_F_pest$PD))
+# 0  1 
+#64 32 
+
+refCMR_medB_F_var_pest <- refCMR_medB_F_var[match(terre_F_pest$patient, rownames(refCMR_medB_F_var)),]
+all(terre_F_pest$patient==rownames(refCMR_medB_F_var_pest)) #TRUE
+
+# VIF
+sapply(vif(lm(refCMR_medB_F_var_pest[,1] ~ terre_F_pest$GRS_scaled + terre_F_pest$PD + terre_F_pest$age + terre_F_pest$alcohol1 + terre_F_pest$smoking + terre_F_pest$head_trauma + terre_F_pest$CTP_PC1 + terre_F_pest$CTP_PC2 + terre_F_pest$CTP_PC3 + terre_F_pest$CTP_PC4 + terre_F_pest$CTP_PC5 + terre_F_pest$CTP_PC6 + terre_F_pest$geno_V3 + terre_F_pest$geno_V4 + terre_F_pest$geno_V5 + terre_F_pest$SentrixPosition_A + terre_F_pest$pesticides))[,3], function(x) x^2)
+##       terre_F_pest$GRS_scaled                terre_F_pest$PD               terre_F_pest$age 
+#                      1.286946                       1.334656                       1.402753 
+#         terre_F_pest$alcohol1           terre_F_pest$smoking       terre_F_pest$head_trauma 
+#                      1.325695                       1.347062                       1.358090 
+#          terre_F_pest$CTP_PC1           terre_F_pest$CTP_PC2           terre_F_pest$CTP_PC3 
+#                      1.512119                       1.658521                       2.120251 
+#          terre_F_pest$CTP_PC4           terre_F_pest$CTP_PC5           terre_F_pest$CTP_PC6 
+#                      1.987059                       1.637013                       1.681244 
+#          terre_F_pest$geno_V3           terre_F_pest$geno_V4           terre_F_pest$geno_V5 
+#                      1.326775                       1.513750                       1.413346 
+#terre_F_pest$SentrixPosition_A        terre_F_pest$pesticides 
+#                      1.295222                       1.370330 
+
+rlm_pvals_F <- lapply(1:ncol(refCMR_medB_F_var_pest), function(x) {
+ RLM <- rlm(refCMR_medB_F_var_pest[,x] ~ terre_F_pest$GRS_scaled + terre_F_pest$PD + terre_F_pest$age + terre_F_pest$smoking + terre_F_pest$alcohol1 + terre_F_pest$head_trauma + terre_F_pest$plate + terre_F_pest$SentrixPosition_A + terre_F_pest$CTP_PC1 + terre_F_pest$CTP_PC2 + terre_F_pest$CTP_PC3 + terre_F_pest$CTP_PC4 + terre_F_pest$CTP_PC5 + terre_F_pest$CTP_PC6 + terre_F_pest$geno_V3 + terre_F_pest$geno_V4 + terre_F_pest$geno_V5 + terre_F_pest$pesticides, psi = psi.huber, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+png("~/PD_GRS/EWAS_TERRE/qqplot_CMRs_F_env_20Mar26.png")
+qqunif.plot(unlist(rlm_pvals_F), title="EWAS on reference CMRs: Females")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(unlist(rlm_pvals_F))
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 29363 test-statistics.
+#...estimated bias: -0.23.
+#...estimated inflation: 1.1.
+
+results.F <- as.data.frame(do.call(rbind, rlm_pvals_F))
+rownames(results.F) <- colnames(refCMR_medB_F_var_pest)
+names(results.F)[1] <- "pval"
+results.F$adjP_BH <- p.adjust(results.F$pval, method="BH")
+results.F$TargetID <- rownames(results.F)
+
+coefs_F <- lapply(1:ncol(refCMR_medB_F_var_pest), function(x) {
+ rlm(refCMR_medB_F_var_pest[,x] ~ terre_F_pest$GRS_scaled + terre_F_pest$PD + terre_F_pest$age + terre_F_pest$smoking + terre_F_pest$alcohol1 + terre_F_pest$head_trauma + terre_F_pest$plate + terre_F_pest$SentrixPosition_A + terre_F_pest$CTP_PC1 + terre_F_pest$CTP_PC2 + terre_F_pest$CTP_PC3 + terre_F_pest$CTP_PC4 + terre_F_pest$CTP_PC5 + terre_F_pest$CTP_PC6 + terre_F_pest$geno_V3 + terre_F_pest$geno_V4 + terre_F_pest$geno_V5 + terre_F_pest$pesticides, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(names(coefs_F)==rownames(results.F)) #TRUE
+results.F$adjDB <- unlist(coefs_F)
+
+#how many sites pass DB 0.03 and FDR 0.05 with BH multiple test correction?
+summary(results.F$threshold_adjDB <- (results.F$adjP_BH <= 0.05 & abs(results.F$adjDB) >= 0.03)) #0
+write.csv(results.F, file="~/PD_GRS/EWAS_TERRE/EWAS_CMRs_F_20Mar26.csv", row.names=F)
+
+#Volcano plot
+max(abs(results.F$adjDB)) #0.1064471
+max(-log10(results.F$pval)) #5.406726
+
+png("~/PD_GRS/EWAS_TERRE/volcano_CMRs_F_20Mar26.png", width=200, height=250)
+ggplot(results.F[,c("adjDB","pval")], aes(x=adjDB, y=-log10(pval), colour="gray70")) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") + scale_colour_manual(values="gray70")+
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + xlim(c(-0.1,0.1)) + ylim(c(0,6)) + theme(legend.position="none")
+dev.off()
+```
+![Female EWAS model, with covariates](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_CMRs_F_env_20Mar26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_CMRs_F_20Mar26.png)
+
+There is no differential methylation related to the GRS in females.
+
+## Males
+
+### Without adjustment for environmental covariates
+```{r terre models M unadj, eval=F}
+# VIF
+sapply(vif(lm(refCMR_medB_M_var[,1] ~ terre_M$GRS_scaled + terre_M$PD + terre_M$age + terre_M$CTP_PC1 + terre_M$CTP_PC2 + terre_M$CTP_PC3 + terre_M$CTP_PC4 + terre_M$CTP_PC5 + terre_M$CTP_PC6 + terre_M$geno_V3 + terre_M$geno_V4 + terre_M$geno_V5 + terre_M$SentrixPosition_A))[,3], function(x) x^2)
+#       terre_M$GRS_scaled                terre_M$PD               terre_M$age           terre_M$CTP_PC1 
+#                 1.245618                  1.340113                  1.199105                  1.299700 
+#          terre_M$CTP_PC2           terre_M$CTP_PC3           terre_M$CTP_PC4           terre_M$CTP_PC5 
+#                 1.392933                  1.230877                  1.397338                  1.622319 
+#          terre_M$CTP_PC6           terre_M$geno_V3           terre_M$geno_V4           terre_M$geno_V5 
+#                 1.270577                  1.231604                  1.268380                  1.272634 
+#terre_M$SentrixPosition_A 
+#                 1.204872 
+
+rlm_pvals_M <- lapply(1:ncol(refCMR_medB_M_var), function(x) {
+ RLM <- rlm(refCMR_medB_M_var[,x] ~ terre_M$GRS_scaled + terre_M$PD + terre_M$age + terre_M$plate + terre_M$SentrixPosition_A + terre_M$CTP_PC1 + terre_M$CTP_PC2 + terre_M$CTP_PC3 + terre_M$CTP_PC4 + terre_M$CTP_PC5 + terre_M$CTP_PC6 + terre_M$geno_V3 + terre_M$geno_V4 + terre_M$geno_V5, psi = psi.huber, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+png("~/PD_GRS/EWAS_TERRE/qqplot_CMRs_M_unadj_1Feb26.png")
+qqunif.plot(unlist(rlm_pvals_M), title="EWAS on reference CMRs: Males")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(unlist(rlm_pvals_M))
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 29190 test-statistics.
+#...estimated bias: -0.32.
+#...estimated inflation: 1.1.
+
+results.M <- as.data.frame(do.call(rbind, rlm_pvals_M))
+rownames(results.M) <- colnames(refCMR_medB_M_var)
+names(results.M)[1] <- "pval"
+results.M$adjP_BH <- p.adjust(results.M$pval, method="BH")
+results.M$TargetID <- rownames(results.M)
+
+coefs_M <- lapply(1:ncol(refCMR_medB_M_var), function(x) {
+ rlm(refCMR_medB_M_var[,x] ~ terre_M$GRS_scaled + terre_M$PD + terre_M$age + terre_M$plate + terre_M$SentrixPosition_A + terre_M$CTP_PC1 + terre_M$CTP_PC2 + terre_M$CTP_PC3 + terre_M$CTP_PC4 + terre_M$CTP_PC5 + terre_M$CTP_PC6 + terre_M$geno_V3 + terre_M$geno_V4 + terre_M$geno_V5, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(names(coefs_M)==rownames(results.M)) #TRUE
+results.M$adjDB <- unlist(coefs_M)
+
+#how many sites pass DB 0.03 and FDR 0.05 with BH multiple test correction?
+summary(results.M$threshold_adjDB <- (results.M$adjP_BH <= 0.05 & abs(results.M$adjDB) >= 0.03)) #0
+write.csv(results.M, file="~/PD_GRS/EWAS_TERRE/EWAS_CMRs_M_unadj_1Feb26.csv", row.names=F)
+
+#Volcano plot
+max(abs(results.M$adjDB)) # 0.07492916
+max(-log10(results.M$pval)) #5.05353
+
+png("~/PD_GRS/EWAS_TERRE/volcano_CMRs_M_unadj_1Feb26.png", width=200, height=250)
+ggplot(results.M[,c("adjDB","pval")], aes(x=adjDB, y=-log10(pval), colour="gray70")) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") + scale_colour_manual(values="gray70")+
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + xlim(c(-0.1,0.1)) + ylim(c(0,6)) + theme(legend.position="none")
+dev.off()
+```
+![Male EWAS model, without environmental covariates](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_CMRs_M_unadj_1Feb26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_CMRs_M_unadj_1Feb26.png)
+
+### With adjustment for environmental covariates
+```{r terre models M adj, eval=F}
+nrow(terre_M_pest <- terre_M[complete.cases(terre_M$pesticides),]) #102
+summary(as.factor(terre_M_pest$PD))
+# 0  1 
+#71 31 
+
+refCMR_medB_M_var_pest <- refCMR_medB_M_var[match(terre_M_pest$patient, rownames(refCMR_medB_M_var)),]
+all(terre_M_pest$patient==rownames(refCMR_medB_M_var_pest)) #TRUE
+
+# VIF
+sapply(vif(lm(refCMR_medB_M_var_pest[,1] ~ terre_M_pest$GRS_scaled + terre_M_pest$PD + terre_M_pest$age + terre_M_pest$alcohol1 + terre_M_pest$smoking + terre_M_pest$head_trauma + terre_M_pest$CTP_PC1 + terre_M_pest$CTP_PC2 + terre_M_pest$CTP_PC3 + terre_M_pest$CTP_PC4 + terre_M_pest$CTP_PC5 + terre_M_pest$CTP_PC6 + terre_M_pest$geno_V3 + terre_M_pest$geno_V4 + terre_M_pest$geno_V5 + terre_M_pest$SentrixPosition_A + terre_M_pest$pesticides))[,3], function(x) x^2)
+#       terre_M_pest$GRS_scaled                terre_M_pest$PD               terre_M_pest$age 
+#                      1.425217                       1.638022                       1.634981 
+#         terre_M_pest$alcohol1           terre_M_pest$smoking       terre_M_pest$head_trauma 
+#                      1.335509                       1.446470                       1.452729 
+#          terre_M_pest$CTP_PC1           terre_M_pest$CTP_PC2           terre_M_pest$CTP_PC3 
+#                      1.633281                       1.494546                       1.450687 
+#          terre_M_pest$CTP_PC4           terre_M_pest$CTP_PC5           terre_M_pest$CTP_PC6 
+#                      1.697633                       1.740959                       1.489204 
+#          terre_M_pest$geno_V3           terre_M_pest$geno_V4           terre_M_pest$geno_V5 
+#                      1.465461                       1.478830                       1.447413 
+#terre_M_pest$SentrixPosition_A        terre_M_pest$pesticides 
+#                      1.347219                       1.344323  
+
+rlm_pvals_M <- lapply(1:ncol(refCMR_medB_M_var_pest), function(x) {
+ RLM <- rlm(refCMR_medB_M_var_pest[,x] ~ terre_M_pest$GRS_scaled + terre_M_pest$PD + terre_M_pest$age + terre_M_pest$smoking + terre_M_pest$alcohol1 + terre_M_pest$head_trauma + terre_M_pest$plate + terre_M_pest$SentrixPosition_A + terre_M_pest$CTP_PC1 + terre_M_pest$CTP_PC2 + terre_M_pest$CTP_PC3 + terre_M_pest$CTP_PC4 + terre_M_pest$CTP_PC5 + terre_M_pest$CTP_PC6 + terre_M_pest$geno_V3 + terre_M_pest$geno_V4 + terre_M_pest$geno_V5 + terre_M_pest$pesticides, psi = psi.huber, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+png("~/PD_GRS/EWAS_TERRE/qqplot_CMRs_M_env_20Mar26.png")
+qqunif.plot(unlist(rlm_pvals_M), title="EWAS on reference CMRs: Males")
+dev.off()
+
+## Bias and inflation (based on Z-values)
+zvals <- qnorm(unlist(rlm_pvals_M))
+bacon(zvals)
+#Bacon-object containing 1 set(s) of 29190 test-statistics.
+#...estimated bias: -0.079.
+#...estimated inflation: 1.
+
+results.M <- as.data.frame(do.call(rbind, rlm_pvals_M))
+rownames(results.M) <- colnames(refCMR_medB_M_var_pest)
+names(results.M)[1] <- "pval"
+results.M$adjP_BH <- p.adjust(results.M$pval, method="BH")
+results.M$TargetID <- rownames(results.M)
+
+coefs_M <- lapply(1:ncol(refCMR_medB_M_var_pest), function(x) {
+ rlm(refCMR_medB_M_var_pest[,x] ~ terre_M_pest$GRS_scaled + terre_M_pest$PD + terre_M_pest$age + terre_M_pest$smoking + terre_M_pest$alcohol1 + terre_M_pest$head_trauma + terre_M_pest$plate + terre_M_pest$SentrixPosition_A + terre_M_pest$CTP_PC1 + terre_M_pest$CTP_PC2 + terre_M_pest$CTP_PC3 + terre_M_pest$CTP_PC4 + terre_M_pest$CTP_PC5 + terre_M_pest$CTP_PC6 + terre_M_pest$geno_V3 + terre_M_pest$geno_V4 + terre_M_pest$geno_V5 + terre_M_pest$pesticides, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(names(coefs_M)==rownames(results.M)) #TRUE
+results.M$adjDB <- unlist(coefs_M)
+
+#how many sites pass DB 0.03 and FDR 0.05 with BH multiple test correction?
+summary(results.M$threshold_adjDB <- (results.M$adjP_BH <= 0.05 & abs(results.M$adjDB) >= 0.03)) #0
+write.csv(results.M, file="~/PD_GRS/EWAS_TERRE/EWAS_CMRs_M_20Mar26.csv", row.names=F)
+
+#Volcano plot
+max(abs(results.M$adjDB)) #0.0714498
+max(-log10(results.M$pval)) #4.324968
+
+png("~/PD_GRS/EWAS_TERRE/volcano_CMRs_M_20Mar26.png", width=200, height=250)
+ggplot(results.M[,c("adjDB","pval")], aes(x=adjDB, y=-log10(pval), colour="gray70")) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") + scale_colour_manual(values="gray70")+
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) + xlim(c(-0.1,0.1)) + ylim(c(0,6)) + theme(legend.position="none")
+dev.off()
+```
+![Male EWAS model, with covariates](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/qqplot_CMRs_M_env_20Mar26.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/EWAS_TERRE/volcano_CMRs_M_20Mar26.png)
+
+There is no differential methylation related to the GRS in males.

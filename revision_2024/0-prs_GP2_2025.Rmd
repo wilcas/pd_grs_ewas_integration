@@ -1,0 +1,419 @@
+---
+title: "Construction of GRS in TERRE and DIG-PD"
+output: html_notebook
+---
+
+The manuscript "A Parkinson’s disease genetic risk score associates with blood DNAm on chromosome 17" explores how a genetic risk score (GRS) for Parkinson's disease (PD) associates with blood DNA methylation in the TERRE study of French agricultural workers, and evaluates GRS associations with DNAm in each sex as well as their sensitivity to non-genetic factors. This was originally spearheaded by Will Casazza and was posted as a pre-print on medRxiv in 2023. The current revision (2024, led by Sam Schaffner) aims to address previous reviewer feedback and prepare the manuscript for re-submission.
+
+In this script, summary statistics from GP2 (Leonard et al., 2025) are used to construct GRS in TERRE and DIG-PD.
+
+Created Sep 12, 2022 by Will Casazza
+
+Updated Mar 19, 2026 by Samantha Schaffner: Final checks of GP2 SNPs present during DIG-PD QC stages.
+
+```{r setup, include=FALSE}
+library(rcompanion)
+library(readxl)
+library(tidyverse)
+library(ggpubr)
+library(glue)
+library(data.table)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(biomaRt)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# PD risk score data and matching
+```{r eval=FALSE}
+# 157 independent loci reported in Leonard 2025 pre-print
+gp2 <- read_xlsx("~/PD_GRS/suppl_GP2_2025.xlsx",sheet=4) %>%
+  mutate(CHR = as.numeric(CHR), COUNTED = toupper(`Effect allele`), ALT = toupper(`Reference allele`), POS = BP) %>%
+  filter(!is.na(CHR)) #90 SNPs
+colnames(gp2)[2] <- "SNP"
+
+snp_coord <- paste(paste("chr",pull(gp2[,4]),sep=""), pull(gp2[,5]), "SNP", sep=":")
+
+#check goDMC SNP overlap
+godmc <- read.csv("~/PD_GRS/coloc/godmc_assoc_meta_all_30Dec24.csv.gz")
+nrow(godmc_sub <- godmc[godmc$snp %in% snp_coord,]) #11
+write.csv(godmc_sub, file="~/PD_GRS/WC_scripts/prs_analyses/godmc_gp2_overlap.csv", row.names=F)
+unique(godmc_sub$snp) #"chr8:109633256:SNP"
+pull(gp2[gp2$CHR==8 & gp2$BP==109633256,"SNP"]) #"rs6469273"
+
+gp2 %>%
+  select(SNP, COUNTED, `Beta, all studies`) %>%
+  write_delim("~/PD_GRS/WC_scripts/prs_analyses/gp2_2025_prs_file.txt", col_names = FALSE)
+```
+
+# TERRE PRS Analysis
+Generate PRS using `plink2 --score`:
+```{bash eval=FALSE}
+~/plink2 --bfile ~/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/raw_data.imputed.r2_30.hard_call.maf_mismatch\
+  --score ~/PD_GRS/WC_scripts/prs_analyses/gp2_2025_prs_file.txt list-variants\
+  --out ~/PD_GRS/WC_scripts/prs_analyses/terre_prs_gp2_2025
+
+#Warning: --score: 36 entries in
+#/home1/NEURO/schaffner/PD_GRS/WC_scripts/prs_analyses/gp2_2025_prs_file.txt
+#were skipped due to missing variant IDs.
+
+#121 variants/157 from GP2 passed QC in TERRE and were used to calculate the PRS.
+```
+
+## Checking how many GP2 SNPs were present at each QC stage: TERRE
+```{r terre gp2 check, eval=F}
+## List of GP2 variants
+vars <- read.delim("~/PD_GRS/WC_scripts/prs_analyses/terre_prs_gp2_2025.sscore.vars",header=FALSE)
+vars_excl <- gp2$SNP[-which(gp2$SNP %in% vars$V1)]  
+vars_excl
+# [1] "rs12128848"   "rs76763715"   "rs75548401"   "rs3049686"    "rs6749019"    "rs7563891"    "rs6758044"   
+# [8] "rs10173157"   "rs144678625"  "rs10569457"   "rs1719750116" "rs2857866"    "rs59912548"   "rs60740436"  
+#[15] "rs41316625"   "rs1236644794" "rs11277366"   "rs34504234"   "rs1174256174" "rs11223628"   "rs35303786"  
+#[22] "rs34637584"   "rs61754230"   "rs36003317"   "rs201348288"  "rs35336805"   "rs648397"     "rs68040616"  
+#[29] "rs2532384"    "rs11871753"   "rs143392722"  "rs8074498"    "rs2076574176" "rs143230159"  "rs35428411"  
+#[36] "rs118075805" 
+
+gp2$passed_TERRE_QC <- !(gp2$SNP %in% vars_excl)
+gp2$coord2 <- sapply(1:nrow(gp2), function(x) 
+  paste(unlist(strsplit(gp2$`SNP ID`[x], split=":"))[1], unlist(strsplit(gp2$`SNP ID`[x], split=":"))[2], sep=":"))
+#formatting coordinates:
+#to use UCSC liftOver to convert hg38 coordinates from gp2 SNP file to hg19 coordinates, for matching with older TERRE and DIGPD data. 
+gp2$coord3 <- paste(gp2$coord2, gp2$BP+1, sep="-")
+write.csv(gp2, file="~/PD_GRS/GP2_2025_in_TERRE.csv",row.names=F)
+rm(gp2)
+
+#saved hg19 coordinates from liftOver in a column manually, and over-wrote the file. Read in again.
+gp2_snps <- read.csv("~/PD_GRS/WC_scripts/prs_analyses/GP2_2025_in_TERRE.csv")
+#reformatting the hg19 coordinates for mapping with genotype QC files
+gp2_snps$bp_hg19 <- sapply(1:nrow(gp2_snps), function(x){
+  range <- unlist(strsplit(gp2_snps$coord_hg19[x], split=":"))[2]
+  return(unlist(strsplit(range,split="-"))[1])
+})
+gp2_snps$coord2_hg19 <- paste(gp2_snps$CHR, gp2_snps$bp_hg19, sep=":")
+write.csv(gp2_snps, file="~/PD_GRS/WC_scripts/prs_analyses/GP2_2025_in_TERRE.csv",row.names=F)
+
+### check which TERRE QC step SNPs were excluded at
+
+# before hard-calling
+hardcall <- read.delim("~/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/raw_data.imputed.r2_30.maf_mismatch.pvar") #8,354,188
+hardcall <- hardcall$ID
+length(vars_hc <- vars_excl[vars_excl %in% hardcall]) #11
+rm(hardcall)
+
+# before removal of SNPs with MAF > 0.1 of 1000 genomes ref
+# extract SNP info in bash
+#bcftools query -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\n' /home1/NEURO/schaffner/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/all_imputed_r2_30_rsid.vcf.gz > /home1/NEURO/schaffner/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/all_imputed_r2_30_rsid_snp_info.txt
+#
+maf <- read.table("/home1/NEURO/schaffner/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/all_imputed_r2_30_rsid_snp_info.txt")
+nrow(maf) #12,739,782
+length(vars_maf <- vars_excl[vars_excl %in% maf$V3]) #22
+maf$coord <- paste(maf$V1, maf$V2, sep=":")
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% maf$coord #FALSE FALSE
+rm(maf)
+#save(vars, vars_excl, vars_maf, vars_hc, file="~/PD_GRS/WC_scripts/prs_analyses/gp2_snps_excl_from_terre.RData")
+
+# before removal of SNPs with R2 < 0.3
+# extract SNP info in bash
+#bcftools query -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\n' /home1/NEURO/schaffner/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/all_imputed.vcf.gz > /home1/NEURO/schaffner/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/all_imputed_snp_info.txt
+#
+r2 <- read.table("/home1/NEURO/schaffner/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/all_imputed_snp_info.txt")
+nrow(r2) #47,100,263
+r2$coord <- paste(r2$V1, r2$V2, sep=":")
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% r2$coord # TRUE FALSE
+
+# check how many of the 157 GP2 SNPs are in the imputed snps
+# first, format coordinates for mapping
+snp_coord2 <- sapply(1:length(snp_coord), function(x) unlist(strsplit(snp_coord[x], split=":S"))[1])
+snp_coord2 <- sapply(1:length(snp_coord2), function(x) unlist(strsplit(snp_coord2[x], split="chr"))[2])
+
+# Get vars_excl w/Liftover GP2 coordinates from hg19 --> hg38
+vars_excl_hg19 <- read.delim("/home1/NEURO/schaffner/PD_GRS/WC_scripts/prs_analyses/terre_vars_excl_hg19_coord.bed", header=FALSE)
+vars_excl_hg19$hg19_coord <- sapply(1:nrow(vars_excl_hg19), function(x){
+  split1 <- unlist(strsplit(vars_excl_hg19$V1[x], split="-"))[1]
+  split1 <- gsub("chr", "", split1)
+  return(split1)
+})
+
+nrow(vars_excl_hg19[vars_excl_hg19$hg19_coord %in% r2$coord,]) #33/36 SNPs are in the imputed data.
+rm(r2)
+
+### pre-imputation data
+### TERRE
+terre.init <- read.delim("~/SHARE_DECIPHER/extraction_genetic/TERRE/terre.bim",header=F)
+terre.init$coord <- paste(terre.init$V1, terre.init$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% terre.init$coord]) #10
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% terre.init$coord #TRUE TRUE
+
+raw <- read.delim("~/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/raw_data.geno.bim",header=F)
+raw$coord <- paste(raw$V1, raw$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% raw$coord]) #10
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% raw$coord #TRUE TRUE
+
+raw.maf <- read.delim("~/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/raw_data.geno.maf.bim",header=F)
+raw.maf$coord <- paste(raw.maf$V1, raw.maf$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% raw.maf$coord]) #7
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% raw.maf$coord #FALSE FALSE
+
+raw.maf05 <- read.delim("~/SHARE_DECIPHER/pd_grs_ewas_integration/TERRE_QC/raw_data.geno.maf.mind.sex_check.het_filter.ld1.maf05.bim",header=F)
+raw.maf05$coord <- paste(raw.maf05$V1, raw.maf05$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% raw.maf05$coord]) #6
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% raw.maf05$coord #FALSE FALSE
+```
+
+
+# DIG-PD PRS Analysis
+
+### fam file set-up
+```{r fam setup, eval=F}
+# 1. Load the data
+# check.names=FALSE is crucial so R doesn't alter your sample IDs with an "X"
+traw <- read.table("/home1/NEURO/schaffner/SHARE_DECIPHER/Genetic_data/DIGPD_Processed/raw_data.imputed.r2_90.maf_mismatch.traw", header=TRUE, check.names=FALSE, stringsAsFactors=FALSE)
+colnames(traw) <- sub("^(.*)_\\1$", "\\1", colnames(traw))
+
+# Assuming your .pheno file has a header. 
+# Update "your_data.pheno" to your actual file name
+pheno <- read.table("/home1/NEURO/schaffner/SHARE_DECIPHER/pd_grs_ewas_integration/prs_analyses/DIGPD.pheno", header=TRUE, stringsAsFactors=FALSE)
+
+# 2. Identify the overlapping samples
+# Extract the sample IDs from the traw header (columns 7 to the end)
+traw_samples <- colnames(traw)[7:ncol(traw)]
+head(traw_samples) 
+
+
+# Find the samples present in BOTH the traw file and your pheno file
+# NOTE: Change 'pheno$IID' if your sample ID column is named differently
+keep_samples <- intersect(traw_samples, pheno$IID)
+
+# 3. Subset the .traw file
+# Keep the first 6 metadata columns (CHR, SNP, etc.), plus the matching samples
+traw_subset <- traw[, c(colnames(traw)[1:6], keep_samples)]
+
+# 4. Generate the perfectly aligned .fam file data
+# We build this directly from 'keep_samples' to guarantee perfect order
+new_fam <- data.frame(
+  FID = keep_samples,
+  IID = keep_samples,
+  Pat = 0,
+  Mat = 0,
+  Sex = 0,
+  Pheno = -9 # Default to missing initially
+)
+
+# 5. Inject the phenotype data
+# match() finds the correct row index in 'pheno' for each sample in 'new_fam',
+# ensuring phenotypes are mapped without altering the row order.
+# NOTE: Change 'pheno$Pheno_Value' to the actual name of your phenotype column
+match_indices <- match(new_fam$IID, pheno$IID)
+new_fam$Pheno <- pheno$PD[match_indices]
+
+# add sex information
+pheno_f <- read.table("/home1/NEURO/schaffner/SHARE_DECIPHER/pd_grs_ewas_integration/prs_analyses/DIGPD_female.pheno", header=TRUE, stringsAsFactors=FALSE)
+pheno_m <- read.table("/home1/NEURO/schaffner/SHARE_DECIPHER/pd_grs_ewas_integration/prs_analyses/DIGPD_male.pheno", header=TRUE, stringsAsFactors=FALSE)
+new_fam[new_fam$FID %in% pheno_f$FID,"Sex"] <- 2
+new_fam[new_fam$FID %in% pheno_m$FID,"Sex"] <- 1
+
+# 6. Export the new, clean files
+write.table(new_fam, "/home1/NEURO/schaffner/SHARE_DECIPHER/Genetic_data/DIGPD_Processed/raw_data.imputed.r2_90.maf_mismatch_sub.fam", quote=FALSE, row.names=FALSE, col.names=FALSE, sep="\t")
+write.table(traw_subset, "/home1/NEURO/schaffner/SHARE_DECIPHER/Genetic_data/DIGPD_Processed/raw_data.imputed.r2_90.maf_mismatch_sub.traw", quote=FALSE, row.names=FALSE, col.names=TRUE, sep="\t")
+```
+
+Generate DIGPD PRS using `plink2 --score`:
+```{bash eval=FALSE}
+#removing header from traw file, was causing issues with plink 
+tail -n +2 ~/SHARE_DECIPHER/Genetic_data/DIGPD_Processed/raw_data.imputed.r2_90.maf_mismatch_sub.traw > ~/SHARE_DECIPHER/Genetic_data/DIGPD_Processed/raw_data.imputed.r2_90.maf_mismatch_sub_noheader.traw
+
+~/plink2 \
+  --import-dosage ~/SHARE_DECIPHER/Genetic_data/DIGPD_Processed/raw_data.imputed.r2_90.maf_mismatch_sub_noheader.traw noheader skip0=1 skip1=2 chr-col-num=1 pos-col-num=4 ref-first \
+  --fam ~/SHARE_DECIPHER/Genetic_data/DIGPD_Processed/raw_data.imputed.r2_90.maf_mismatch_sub.fam \
+  --score ~/PD_GRS/WC_scripts/prs_analyses/gp2_2025_prs_file.txt list-variants \
+  --out ~/PD_GRS/WC_scripts/prs_analyses/digpd_prs_gp2_2025
+
+#Warning: --score: 37 entries in
+#/home1/NEURO/schaffner/PD_GRS/WC_scripts/prs_analyses/gp2_2025_prs_file.txt
+#were skipped due to missing variant IDs, and 1 was skipped due to a mismatching
+#allele code.
+#--score: 119 variants processed.
+#--score: Variant list written to #/home1/NEURO/schaffner/PD_GRS/WC_scripts/prs_analyses/digpd_prs_gp2_2025.sscore.vars .
+#--score: Results written to
+#/home1/NEURO/schaffner/PD_GRS/WC_scripts/prs_analyses/digpd_prs_gp2_2025.sscore
+
+#119 variants/157 from GP2 passed QC in DIG-PD and were used to calculate the PRS.
+```
+
+## Checking how many GP2 SNPs were present at each QC stage: DIG-PD
+```{r gp2 check digpd, eval=F}
+## List of GP2 variants
+vars <- read.delim("~/PD_GRS/WC_scripts/prs_analyses/digpd_prs_gp2_2025.sscore.vars",header=FALSE)
+vars_excl <- gp2_snps$SNP[-which(gp2_snps$SNP %in% vars$V1)]  
+vars_excl
+# [1] "rs76763715"   "rs75548401"   "rs72712893"   "rs72714968"   "rs61802091"   "rs3049686"    "rs12073680"  
+# [8] "rs9309337"    "rs10173157"   "rs10569457"   "rs1719750116" "rs59912548"   "rs356182"     "rs11241774"  
+#[15] "rs60740436"   "rs41316625"   "rs1236644794" "rs146617529"  "rs11277366"   "rs34504234"   "rs4872005"   
+#[22] "rs2282295"    "rs1174256174" "rs34637584"   "rs10847864"   "rs36003317"   "rs201348288"  "rs35336805"  
+#[29] "rs648397"     "rs68040616"   "rs2532384"    "rs190825568"  "rs72843781"   "rs143392722"  "rs2076574176"
+#[36] "rs143230159"  "rs35428411"   "rs118075805" 
+
+gp2_snps$passed_DIGPD_QC <- !(gp2_snps$SNP %in% vars_excl)
+write.csv(gp2_snps, file="~/PD_GRS/WC_scripts/prs_analyses/GP2_2025_in_TERRE_DIGPD.csv", row.names=F)
+
+### DIGPD cases post-imputation data
+#first imputation
+all_cas_imp <- read.table(pipe("zgrep -v '^#' /home1/NEURO/casazza/genotype_qc/DIGPD_case_QC/impute_round1/all_imputed.vcf.gz | cut -f3"), stringsAsFactors = FALSE)
+nrow(all_cas_imp) #47,113,743
+
+clean_snps <- all_cas_imp %>%
+  separate(V1, into = c("chr", "pos", "ref", "alt"), sep = ":", remove = FALSE)
+head(clean_snps)
+clean_snps$coord2 <- sapply(1:length(clean_snps$V1), function(x) 
+  paste(unlist(strsplit(clean_snps$V1[x], split=":"))[1], unlist(strsplit(clean_snps$V1[x], split=":"))[2], sep=":"))
+save(clean_snps, file="~/PD_GRS/WC_scripts/prs_analyses/all_imp_SNPs_DIGPD_cas_clean.RData")
+nrow(gp2_snps[gp2_snps$coord2_hg19 %in% clean_snps$coord2,]) #154
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% clean_snps$coord2 #TRUE FALSE
+rm(all_cas_imp, clean_snps)
+
+#second imputation
+# extract SNP info in bash
+#bcftools query -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\n' /home1/NEURO/casazza/genotype_qc/DIGPD_case_QC/impute_round2/all_imputed_r2_90_rsid.vcf.gz > /home1/NEURO/casazza/genotype_qc/DIGPD_case_QC/impute_round2/all_imputed_r2_90_rsid_snp_info.txt
+#
+cas_imp2 <- read.table("/home1/NEURO/casazza/genotype_qc/DIGPD_case_QC/impute_round2/all_imputed_r2_90_rsid_snp_info.txt", header=F)
+cas_imp2$coord <- paste(cas_imp2$V1, cas_imp2$V2, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% cas_imp2$coord]) #126
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% cas_imp2$coord2 #[1] FALSE FALSE
+rm(cas_imp2)
+
+### DIGPD controls post-imputation data
+#first imputation
+all_ctrl_imp <- read.table(pipe("zgrep -v '^#' /home1/NEURO/casazza/genotype_qc/DIGPD_control_QC/impute_round1/all_imputed.vcf.gz | cut -f3"), stringsAsFactors = FALSE)
+nrow(all_ctrl_imp) #47,100,286
+
+clean_snps <- all_ctrl_imp %>%
+  separate(V1, into = c("chr", "pos", "ref", "alt"), sep = ":", remove = FALSE)
+head(clean_snps)
+clean_snps$coord2 <- sapply(1:length(clean_snps$V1), function(x) 
+  paste(unlist(strsplit(clean_snps$V1[x], split=":"))[1], unlist(strsplit(clean_snps$V1[x], split=":"))[2], sep=":"))
+save(clean_snps, file="~/PD_GRS/WC_scripts/prs_analyses/all_imp_SNPs_DIGPD_ctrl_clean.RData")
+nrow(gp2_snps[gp2_snps$coord2_hg19 %in% clean_snps$coord2,]) #154
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% clean_snps$coord2 #TRUE FALSE
+rm(all_ctrl_imp, clean_snps)
+
+#second imputation
+# extract SNP info in bash
+#bcftools query -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\n' /home1/NEURO/casazza/genotype_qc/DIGPD_control_QC/impute_round2/all_imputed_r2_90_rsid.vcf.gz > /home1/NEURO/casazza/genotype_qc/DIGPD_control_QC/impute_round2/all_imputed_r2_90_rsid_snp_info.txt
+#
+ctrl_imp2 <- read.table("/home1/NEURO/casazza/genotype_qc/DIGPD_control_QC/impute_round2/all_imputed_r2_90_rsid_snp_info.txt", header=F)
+ctrl_imp2$coord <- paste(ctrl_imp2$V1, ctrl_imp2$V2, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% ctrl_imp2$coord]) #115
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord2_hg19"] %in% ctrl_imp2$coord #FALSE FALSE
+rm(ctrl_imp2)
+
+### DIGPD merged post-imputation data
+# check which QC step SNPs were excluded at
+
+# before hard-calling
+#extract SNP information from traw file
+#awk '{print $1, $2, $3, $4, $5}' /home1/NEURO/casazza/genotype_qc/DIGPD_merged_post_imputation_QC/raw_data.imputed.r2_90.maf_mismatch.gen > /home1/NEURO/casazza/genotype_qc/DIGPD_merged_post_imputation_QC/raw_data.imputed.r2_90.maf_mismatch.snp_info.txt
+#
+hardcall <- read.delim("/home1/NEURO/casazza/genotype_qc/DIGPD_merged_post_imputation_QC/raw_data.imputed.r2_90.maf_mismatch.snp_info.txt",header=F,sep=" ")
+hardcall$coord <- paste(hardcall$V1, hardcall$V3, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% hardcall$coord]) #121
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord_hg19"] %in% hardcall$coord #FALSE FALSE
+rm(hardcall)
+
+# before removal of SNPs with MAF > 0.1 of 1000 genomes ref
+#extract SNP information from traw file
+#awk '{print $1, $2, $3, $4, $5}' /home1/NEURO/casazza/genotype_qc/DIGPD_merged_post_imputation_QC/all_imputed_r2_90_rsid.gen > /home1/NEURO/casazza/genotype_qc/DIGPD_merged_post_imputation_QC/all_imputed_r2_90_rsid.snp_info.txt
+#
+maf <- read.delim("/home1/NEURO/casazza/genotype_qc/DIGPD_merged_post_imputation_QC/all_imputed_r2_90_rsid.snp_info.txt",header=F,sep=" ")
+maf$coord <- paste(maf$V1, maf$V3, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% maf$coord]) #121
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord_hg19"] %in% maf$coord #FALSE FALSE
+rm(maf)
+
+
+### pre-imputation QC
+
+### DIGPD controls
+digpd.ctrl.init <- read.delim("~/SHARE_DECIPHER/extraction_genetic/DIGPD_controls/ctrl_digpd.bim",header=F)
+digpd.ctrl.init$coord <- paste(digpd.ctrl.init$V1, digpd.ctrl.init$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% digpd.ctrl.init$coord]) #11
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord_hg19"] %in% digpd.ctrl.init$coord #FALSE FALSE
+
+raw <- read.delim("/home1/NEURO/casazza/genotype_qc/DIGPD_control_QC/raw_data.geno.bim",header=F)
+raw$coord <- paste(raw$V1, raw$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% raw$coord]) #11
+
+raw.maf <- read.delim("/home1/NEURO/casazza/genotype_qc/DIGPD_control_QC/raw_data.geno.maf.bim",header=F)
+raw.maf$coord <- paste(raw.maf$V1, raw.maf$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% raw.maf$coord]) #8
+
+raw.maf05 <- read.delim("/home1/NEURO/casazza/genotype_qc/DIGPD_control_QC/raw_data.geno.maf.mind.sex_check.het_filter.ld1.maf05.bim",header=F)
+raw.maf05$coord <- paste(raw.maf05$V1, raw.maf05$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% raw.maf05$coord]) #6
+
+### DIGPD cases
+raw <- read.delim("/home1/NEURO/casazza/genotype_qc/DIGPD_case_QC/raw_data.geno.bim",header=F)
+raw$coord <- paste(raw$V1, raw$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% raw$coord]) #27
+gp2_snps[gp2_snps$SNP%in%c("rs34637584","rs76763715"),"coord_hg19"] %in% raw$coord #FALSE FALSE
+
+raw.maf <- read.delim("/home1/NEURO/casazza/genotype_qc/DIGPD_case_QC/raw_data.geno.maf.bim",header=F)
+raw.maf$coord <- paste(raw.maf$V1, raw.maf$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% raw.maf$coord]) #23
+
+raw.maf05 <- read.delim("/home1/NEURO/casazza/genotype_qc/DIGPD_case_QC/raw_data.geno.maf.mind.sex_check.het_filter.ld1.maf05.bim",header=F)
+raw.maf05$coord <- paste(raw.maf05$V1, raw.maf05$V4, sep=":")
+length(gp2_snps$coord2_hg19[gp2_snps$coord2_hg19 %in% raw.maf05$coord]) #17
+```
+
+# Plot the GP2 meta-analysis effect sizes for SNPs excluded from each sample
+```{r gp2 beta, eval=F}
+### TERRE
+# Pre-compute jittered positions and add to dataframe
+gp2_snps$jittered_x <- as.numeric(as.factor(gp2_snps$passed_TERRE_QC)) + 
+                        runif(nrow(gp2_snps), -0.2, 0.2)
+gp2_snps$jittered_y <- gp2_snps$Beta..all.studies
+
+# Subset for labels
+label_data <- gp2_snps[gp2_snps$Beta..all.studies > 0.5, ]
+
+png("~/PD_GRS/WC_scripts/prs_analyses/gp2_snps_terre.png", width=300, height=300)
+ggplot(gp2_snps, aes(x=passed_TERRE_QC, y=Beta..all.studies, col=passed_TERRE_QC)) + geom_boxplot(outlier.shape=NA) + geom_point(aes(x = jittered_x), stat = "identity")+ theme_classic() + ggtitle("GP2 GRS SNP weights in TERRE") + ylab("GP2 beta, all studies") + theme(legend.position="none") +
+    geom_label_repel(
+    data = label_data,
+    aes(x = jittered_x, y = jittered_y, label = SNP),  # use pre-computed positions
+    size = 3,
+    force = 10,
+    max.overlaps = 16,
+    min.segment.length = 0.1
+  )
+dev.off()
+
+### DIG-PD
+# Pre-compute jittered positions and add to dataframe
+gp2_snps$jittered_x <- as.numeric(as.factor(gp2_snps$passed_DIGPD_QC)) + 
+                        runif(nrow(gp2_snps), -0.2, 0.2)
+
+# Subset for labels
+label_data <- gp2_snps[gp2_snps$Beta..all.studies > 0.5, ]
+
+png("~/PD_GRS/WC_scripts/prs_analyses/gp2_snps_digpd.png", width=300, height=300)
+ggplot(gp2_snps, aes(x=passed_DIGPD_QC, y=Beta..all.studies, col=passed_DIGPD_QC)) + geom_boxplot(outlier.shape=NA) + geom_point(aes(x = jittered_x), stat = "identity")+ theme_classic() + ggtitle("GP2 GRS SNP weights in DIG-PD") + ylab("GP2 beta, all studies") + theme(legend.position="none") +
+    geom_label_repel(
+    data = label_data,
+    aes(x = jittered_x, y = jittered_y, label = SNP),  # use pre-computed positions
+    size = 3,
+    force = 10,
+    max.overlaps = 16,
+    min.segment.length = 0.1
+  )
+dev.off()
+```
+![](/home1/NEURO/schaffner/PD_GRS/WC_scripts/prs_analyses/gp2_snps_terre.png)
+
+![](/home1/NEURO/schaffner/PD_GRS/WC_scripts/prs_analyses/gp2_snps_digpd.png)
+
+The two highest-weighted SNPs in the GP2 analysis, rs34637584 and rs76763715, are excluded from both samples.
+
